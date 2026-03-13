@@ -1,0 +1,27 @@
+# ──────────────────────────────────────────────
+# Dynatrace Multi-Environment Analyzer Config
+# ──────────────────────────────────────────────
+# Rename this file to config.yaml and fill in your details.
+
+environments:
+  - name: "PROD"
+    url: "https://abc12345.live.dynatrace.com"   # No trailing slash
+    token: "dt0c01.XXXXXXXX.YYYYYYYYYYYYYYYY"
+    type: "SaaS"           # SaaS | Managed
+
+  - name: "NON-PROD"
+    url: "https://def67890.live.dynatrace.com"
+    token: "dt0c01.XXXXXXXX.YYYYYYYYYYYYYYYY"
+    type: "SaaS"
+
+  - name: "DR"
+    url: "https://ghi11223.live.dynatrace.com"
+    token: "dt0c01.XXXXXXXX.YYYYYYYYYYYYYYYY"
+    type: "SaaS"
+
+settings:
+  timeout_seconds: 30
+  max_retries: 3
+  rate_limit_pause: 0.25       # seconds between API calls
+  lookback_days: 30            # for problems/events analysis
+  output_dir: "./dt_reports"

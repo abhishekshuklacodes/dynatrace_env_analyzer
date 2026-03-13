@@ -1,0 +1,30 @@
+# Config with secrets
+config.yaml
+
+# Reports output
+dt_reports/
+*.pdf
+*.png
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
