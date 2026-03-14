@@ -1,33 +1,47 @@
 #!/usr/bin/env python3
 """
-Dynatrace Multi-Environment Comprehensive Analyzer
-====================================================
+Dynatrace Multi-Environment Comprehensive Analyzer v4.0
+========================================================
 Author  : Abhi (Observability Operations)
-Purpose : Audit 3 Dynatrace environments via API v2, detect deprecated API usage,
-          generate Smartscape-like architecture diagrams, identify gaps,
-          and produce a consolidated PDF report with recommendations.
+Purpose : Audit multiple Dynatrace environments via API v2, detect deprecated API
+          usage, generate Smartscape-like architecture diagrams, identify gaps,
+          and produce consolidated PDF + interactive HTML dashboard + JSON export.
+
+Refactored from:
+  - dt_env_analyzer.py  (v3.0) — robust API client, pagination, PDF report
+  - main_pdf.py         (v3.2) — data ingestion metrics, noise analysis, HTML dashboard
+
+Key improvements in v4.0:
+  - Merged data ingestion (log, metric, DDU) analysis from v3.2
+  - Added noise-source detection (recurring problem titles) from v3.2
+  - Added anomaly detection settings audit from v3.2
+  - Added Davis AI summary per environment from v3.2
+  - Dual output: PDF report + interactive HTML dashboard with Plotly charts
+  - JSON raw data export for downstream tooling (n8n, ServiceNow, etc.)
+  - SSL verification toggle per environment (for Managed behind corporate proxy)
+  - Removed dependency on `dynatrace` SDK — pure requests-based (zero SDK deps)
+  - Fixed: pagination nextPageKey handling per Dynatrace docs
+  - Fixed: Smartscape diagram variable scoping bug on failure
+  - Added: Anomaly detection schemas audit (services, RUM, infra)
+  - Added: Cross-environment gap comparison matrix
 
 Required Token Scopes (per environment):
-  - entities.read
-  - metrics.read
-  - problems.read
-  - settings.read
-  - events.read
-  - activeGates.read
-  - securityProblems.read
-  - syntheticLocations.read
-  - syntheticExecution.read
-  - attacks.read (optional)
-  - slo.read
-  - extensions.read
-  - networkZones.read
-  - oneAgents.read
-  - auditLogs.read
+  - entities.read           — Entity topology & relationships
+  - metrics.read            — Metrics metadata + data ingestion volumes
+  - problems.read           — Problem feed analysis
+  - settings.read           — Settings 2.0 (alerting, MZ, tags, anomaly detection)
+  - events.read             — Event feed
+  - activeGates.read        — ActiveGate inventory
+  - slo.read                — SLO evaluation
+  - oneAgents.read          — OneAgent inventory
+  - auditLogs.read          — Config audit trail
+  - networkZones.read       — Network zone config
+  - extensions.read         — Extensions 2.0 inventory
 
 Usage:
-  1. Copy config.yaml.template -> config.yaml
-  2. Fill in your environment URLs and API tokens
-  3. python dt_env_analyzer.py [--config config.yaml] [--output report.pdf]
+  python dt_env_analyzer.py --config config.yaml
+  python dt_env_analyzer.py --config config.yaml --output report.pdf --html
+  python dt_env_analyzer.py --generate-template
 """
 
 import argparse
@@ -37,27 +51,26 @@ import os
 import sys
 import time
 import traceback
+import urllib3
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import yaml
 import requests
 import graphviz
 
-# ── PDF generation ──────────────────────────────────────────────────
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import inch, mm
+from reportlab.lib.units import mm
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle,
-    PageBreak, Image, KeepTogether, HRFlowable
+    PageBreak, Image, HRFlowable,
 )
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER
 
-# ─── Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -65,244 +78,112 @@ logging.basicConfig(
 )
 log = logging.getLogger("dt-analyzer")
 
+
 # ═══════════════════════════════════════════════════════════════════
 #  CONSTANTS & REFERENCE DATA
 # ═══════════════════════════════════════════════════════════════════
 
-# Full deprecated API map: deprecated endpoint → (replacement, deprecated since, EOL)
 DEPRECATED_API_MAP = {
-    # V1 → V2 migrations
-    "/api/v1/timeseries": {
-        "replacement": "/api/v2/metrics/query",
-        "deprecated_since": "SaaS 1.305 / Managed 1.316",
-        "eol": "End of 2025",
-        "severity": "CRITICAL",
-    },
-    "/api/v1/entity": {
-        "replacement": "/api/v2/entities",
-        "deprecated_since": "1.263",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/entity/infrastructure/hosts": {
-        "replacement": "/api/v2/entities?entitySelector=type(HOST)",
-        "deprecated_since": "1.263",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/entity/infrastructure/processes": {
-        "replacement": "/api/v2/entities?entitySelector=type(PROCESS_GROUP_INSTANCE)",
-        "deprecated_since": "1.263",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/entity/infrastructure/process-groups": {
-        "replacement": "/api/v2/entities?entitySelector=type(PROCESS_GROUP)",
-        "deprecated_since": "1.263",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/entity/services": {
-        "replacement": "/api/v2/entities?entitySelector=type(SERVICE)",
-        "deprecated_since": "1.263",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/entity/applications": {
-        "replacement": "/api/v2/entities?entitySelector=type(APPLICATION)",
-        "deprecated_since": "1.263",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/problem": {
-        "replacement": "/api/v2/problems",
-        "deprecated_since": "SaaS 1.243 / Managed 1.244",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/events": {
-        "replacement": "/api/v2/events",
-        "deprecated_since": "SaaS 1.243 / Managed 1.244",
-        "eol": "TBD",
-        "severity": "HIGH",
-    },
-    "/api/v1/tokens": {
-        "replacement": "/api/v2/apiTokens",
-        "deprecated_since": "1.252",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/v1/maintenance-window": {
-        "replacement": "/api/v2/settings (schema: builtin:alerting.maintenance-window)",
-        "deprecated_since": "SaaS 1.173 / Managed 1.174",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/config/v1/maintenanceWindows": {
-        "replacement": "/api/v2/settings (schema: builtin:alerting.maintenance-window)",
-        "deprecated_since": "SaaS 1.173 / Managed 1.174",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/config/v1/credentials": {
-        "replacement": "/api/v2/credentials",
-        "deprecated_since": "1.252",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    # Log Monitoring v2 search/export → Grail
-    "/api/v2/logs/search": {
-        "replacement": "Grail Query API (Logs on Grail)",
-        "deprecated_since": "SaaS 1.280 / Managed 1.284",
-        "eol": "End of 2027",
-        "severity": "MEDIUM",
-    },
-    "/api/v2/logs/export": {
-        "replacement": "Grail Query API (Logs on Grail)",
-        "deprecated_since": "SaaS 1.280 / Managed 1.284",
-        "eol": "End of 2027",
-        "severity": "MEDIUM",
-    },
-    "/api/v2/logs/aggregate": {
-        "replacement": "Grail Query API (Logs on Grail)",
-        "deprecated_since": "SaaS 1.280 / Managed 1.284",
-        "eol": "End of 2027",
-        "severity": "MEDIUM",
-    },
-    # Settings 2.0 migrations
-    "/api/config/v1/autoTags": {
-        "replacement": "/api/v2/settings (schema: builtin:tags.auto-tagging)",
-        "deprecated_since": "Settings 2.0 migration",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/config/v1/alertingProfiles": {
-        "replacement": "/api/v2/settings (schema: builtin:alerting.profile)",
-        "deprecated_since": "Settings 2.0 migration",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/config/v1/notifications": {
-        "replacement": "/api/v2/settings (schema: builtin:problem.notifications)",
-        "deprecated_since": "Settings 2.0 migration",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/config/v1/managementZones": {
-        "replacement": "/api/v2/settings (schema: builtin:management-zones)",
-        "deprecated_since": "Settings 2.0 migration",
-        "eol": "TBD",
-        "severity": "MEDIUM",
-    },
-    "/api/config/v1/requestAttributes": {
-        "replacement": "/api/v2/settings (schema: builtin:request-attributes)",
-        "deprecated_since": "Settings 2.0 migration",
-        "eol": "TBD",
-        "severity": "LOW",
-    },
+    "/api/v1/timeseries": {"replacement": "/api/v2/metrics/query", "deprecated_since": "SaaS 1.305 / Managed 1.316", "eol": "End of 2025", "severity": "CRITICAL"},
+    "/api/v1/entity": {"replacement": "/api/v2/entities", "deprecated_since": "1.263", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/entity/infrastructure/hosts": {"replacement": "/api/v2/entities?entitySelector=type(HOST)", "deprecated_since": "1.263", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/entity/infrastructure/processes": {"replacement": "/api/v2/entities?entitySelector=type(PROCESS_GROUP_INSTANCE)", "deprecated_since": "1.263", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/entity/infrastructure/process-groups": {"replacement": "/api/v2/entities?entitySelector=type(PROCESS_GROUP)", "deprecated_since": "1.263", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/entity/services": {"replacement": "/api/v2/entities?entitySelector=type(SERVICE)", "deprecated_since": "1.263", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/entity/applications": {"replacement": "/api/v2/entities?entitySelector=type(APPLICATION)", "deprecated_since": "1.263", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/problem": {"replacement": "/api/v2/problems", "deprecated_since": "SaaS 1.243 / Managed 1.244", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/events": {"replacement": "/api/v2/events", "deprecated_since": "SaaS 1.243 / Managed 1.244", "eol": "TBD", "severity": "HIGH"},
+    "/api/v1/tokens": {"replacement": "/api/v2/apiTokens", "deprecated_since": "1.252", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/v1/maintenance-window": {"replacement": "/api/v2/settings (builtin:alerting.maintenance-window)", "deprecated_since": "SaaS 1.173 / Managed 1.174", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/config/v1/maintenanceWindows": {"replacement": "/api/v2/settings (builtin:alerting.maintenance-window)", "deprecated_since": "SaaS 1.173 / Managed 1.174", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/config/v1/credentials": {"replacement": "/api/v2/credentials", "deprecated_since": "1.252", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/v2/logs/search": {"replacement": "Grail Query API", "deprecated_since": "SaaS 1.280 / Managed 1.284", "eol": "End of 2027", "severity": "MEDIUM"},
+    "/api/v2/logs/export": {"replacement": "Grail Query API", "deprecated_since": "SaaS 1.280 / Managed 1.284", "eol": "End of 2027", "severity": "MEDIUM"},
+    "/api/v2/logs/aggregate": {"replacement": "Grail Query API", "deprecated_since": "SaaS 1.280 / Managed 1.284", "eol": "End of 2027", "severity": "MEDIUM"},
+    "/api/config/v1/autoTags": {"replacement": "/api/v2/settings (builtin:tags.auto-tagging)", "deprecated_since": "Settings 2.0 migration", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/config/v1/alertingProfiles": {"replacement": "/api/v2/settings (builtin:alerting.profile)", "deprecated_since": "Settings 2.0 migration", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/config/v1/notifications": {"replacement": "/api/v2/settings (builtin:problem.notifications)", "deprecated_since": "Settings 2.0 migration", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/config/v1/managementZones": {"replacement": "/api/v2/settings (builtin:management-zones)", "deprecated_since": "Settings 2.0 migration", "eol": "TBD", "severity": "MEDIUM"},
+    "/api/config/v1/requestAttributes": {"replacement": "/api/v2/settings (builtin:request-attributes)", "deprecated_since": "Settings 2.0 migration", "eol": "TBD", "severity": "LOW"},
 }
 
-# Token scopes needed for comprehensive audit
-REQUIRED_SCOPES = [
-    "entities.read",
-    "metrics.read",
-    "problems.read",
-    "settings.read",
-    "events.read",
-    "activeGates.read",
-    "slo.read",
-    "oneAgents.read",
-    "auditLogs.read",
-    "networkZones.read",
-    "extensions.read",
-]
-
-# Key entity types for Smartscape-like topology
 SMARTSCAPE_ENTITY_TYPES = [
-    "HOST",
-    "PROCESS_GROUP",
-    "PROCESS_GROUP_INSTANCE",
-    "SERVICE",
-    "APPLICATION",
-    "HTTP_CHECK",
-    "BROWSER_MONITOR",
-    "SYNTHETIC_TEST",
-    "KUBERNETES_CLUSTER",
-    "CLOUD_APPLICATION",
-    "CLOUD_APPLICATION_NAMESPACE",
+    "HOST", "PROCESS_GROUP", "PROCESS_GROUP_INSTANCE", "SERVICE",
+    "APPLICATION", "HTTP_CHECK", "BROWSER_MONITOR", "SYNTHETIC_TEST",
+    "KUBERNETES_CLUSTER", "CLOUD_APPLICATION", "CLOUD_APPLICATION_NAMESPACE",
 ]
 
-# Color palette (Dynatrace-inspired)
-DT_PURPLE = "#6F2DA8"
-DT_BLUE = "#1496FF"
-DT_GREEN = "#2AB06F"
-DT_RED = "#DC172A"
-DT_ORANGE = "#FF6A00"
-DT_GRAY = "#B4B4B4"
-DT_DARK = "#1A1A2E"
+INGESTION_METRICS = {
+    "log_ingest_bytes": "builtin:billing.log_storage.total_volume",
+    "metric_ingest_total": "builtin:billing.ddu.metrics.total",
+    "ddu_total": "builtin:billing.ddu",
+}
+
+ANOMALY_SCHEMAS = [
+    "builtin:anomaly-detection.infrastructure-hosts",
+    "builtin:anomaly-detection.infrastructure-disks",
+    "builtin:anomaly-detection.services",
+    "builtin:anomaly-detection.rum-web",
+    "builtin:anomaly-detection.databases",
+]
+
+DT_PURPLE, DT_BLUE, DT_GREEN, DT_RED, DT_ORANGE, DT_DARK = "#6F2DA8", "#1496FF", "#2AB06F", "#DC172A", "#FF6A00", "#1A1A2E"
+
 
 # ═══════════════════════════════════════════════════════════════════
-#  CONFIG LOADER
+#  CONFIG
 # ═══════════════════════════════════════════════════════════════════
 
-DEFAULT_CONFIG_TEMPLATE = """# ──────────────────────────────────────────────
-# Dynatrace Multi-Environment Analyzer Config
-# ──────────────────────────────────────────────
-# Rename this file to config.yaml and fill in your details.
-
+DEFAULT_CONFIG_TEMPLATE = """# Dynatrace Multi-Environment Analyzer v4.0 — Configuration
 environments:
   - name: "PROD"
-    url: "https://abc12345.live.dynatrace.com"   # No trailing slash
+    url: "https://abc12345.live.dynatrace.com"
     token: "dt0c01.XXXXXXXX.YYYYYYYYYYYYYYYY"
-    type: "SaaS"           # SaaS | Managed
+    type: "SaaS"
+    verify_ssl: true
 
   - name: "NON-PROD"
     url: "https://def67890.live.dynatrace.com"
     token: "dt0c01.XXXXXXXX.YYYYYYYYYYYYYYYY"
     type: "SaaS"
+    verify_ssl: true
 
   - name: "DR"
     url: "https://ghi11223.live.dynatrace.com"
     token: "dt0c01.XXXXXXXX.YYYYYYYYYYYYYYYY"
     type: "SaaS"
+    verify_ssl: true
 
 settings:
   timeout_seconds: 30
   max_retries: 3
-  rate_limit_pause: 0.25       # seconds between API calls
-  lookback_days: 30            # for problems/events analysis
+  rate_limit_pause: 0.25
+  lookback_days: 30
   output_dir: "./dt_reports"
+  generate_html: true
+  generate_json: true
 """
 
 
 def load_config(config_path: str) -> dict:
-    """Load and validate YAML configuration."""
     path = Path(config_path)
     if not path.exists():
-        # Generate template
-        template_path = path.with_suffix(".yaml.template")
-        template_path.write_text(DEFAULT_CONFIG_TEMPLATE)
-        log.error(f"Config file not found: {config_path}")
-        log.info(f"Template created at: {template_path}")
-        log.info("Fill in your Dynatrace environment details and rename to config.yaml")
+        Path(config_path + ".template").write_text(DEFAULT_CONFIG_TEMPLATE)
+        log.error(f"Config not found: {config_path} — template created.")
         sys.exit(1)
-
     with open(path) as f:
         cfg = yaml.safe_load(f)
-
-    # Validate
-    if "environments" not in cfg or len(cfg["environments"]) == 0:
-        log.error("No environments defined in config.")
-        sys.exit(1)
-
+    if not cfg.get("environments"):
+        log.error("No environments in config."); sys.exit(1)
     for env in cfg["environments"]:
-        for key in ("name", "url", "token"):
-            if key not in env or not env[key]:
-                log.error(f"Missing '{key}' in environment config: {env}")
-                sys.exit(1)
-        # Strip trailing slash
+        for k in ("name", "url", "token"):
+            if not env.get(k):
+                log.error(f"Missing '{k}' in: {env}"); sys.exit(1)
         env["url"] = env["url"].rstrip("/")
-
+        env.setdefault("type", "SaaS")
+        env.setdefault("verify_ssl", True)
+    if any(not e.get("verify_ssl", True) for e in cfg["environments"]):
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return cfg
 
 
@@ -311,211 +192,110 @@ def load_config(config_path: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════
 
 class DynatraceClient:
-    """Robust Dynatrace API v2 client with pagination, retry, and rate-limit handling."""
+    """Pure-requests Dynatrace API v2 client. No SDK dependency."""
 
-    def __init__(self, name: str, url: str, token: str, env_type: str = "SaaS",
-                 timeout: int = 30, max_retries: int = 3, rate_pause: float = 0.25):
-        self.name = name
-        self.base_url = url
-        self.token = token
-        self.env_type = env_type
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.rate_pause = rate_pause
+    def __init__(self, name, url, token, env_type="SaaS", verify_ssl=True,
+                 timeout=30, max_retries=3, rate_pause=0.25):
+        self.name, self.base_url, self.token = name, url, token
+        self.env_type, self.verify_ssl = env_type, verify_ssl
+        self.timeout, self.max_retries, self.rate_pause = timeout, max_retries, rate_pause
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Api-Token {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        })
+        self.session.headers.update({"Authorization": f"Api-Token {token}",
+                                      "Content-Type": "application/json", "Accept": "application/json"})
+        self.session.verify = verify_ssl
         self._call_count = 0
 
-    def _request(self, method: str, endpoint: str, params: dict = None,
-                 json_body: dict = None) -> Optional[dict]:
-        """Make an API request with retry logic."""
+    def _request(self, method, endpoint, params=None, json_body=None) -> Optional[dict]:
         url = f"{self.base_url}{endpoint}"
         for attempt in range(1, self.max_retries + 1):
             try:
                 time.sleep(self.rate_pause)
                 self._call_count += 1
-                resp = self.session.request(
-                    method, url, params=params, json=json_body, timeout=self.timeout
-                )
+                resp = self.session.request(method, url, params=params, json=json_body, timeout=self.timeout)
                 if resp.status_code == 429:
                     wait = int(resp.headers.get("Retry-After", 5))
-                    log.warning(f"[{self.name}] Rate limited. Waiting {wait}s...")
-                    time.sleep(wait)
-                    continue
-                if resp.status_code == 401:
-                    log.error(f"[{self.name}] Authentication failed for {endpoint}. Check token scopes.")
-                    return None
-                if resp.status_code == 403:
-                    log.warning(f"[{self.name}] Forbidden: {endpoint}. Missing scope.")
-                    return None
+                    log.warning(f"[{self.name}] Rate limited on {endpoint}. Waiting {wait}s...")
+                    time.sleep(wait); continue
+                if resp.status_code in (401, 403):
+                    log.warning(f"[{self.name}] {resp.status_code} on {endpoint}"); return None
                 if resp.status_code == 404:
-                    log.debug(f"[{self.name}] Not found: {endpoint}")
-                    return None
+                    log.debug(f"[{self.name}] 404: {endpoint}"); return None
                 resp.raise_for_status()
-                if resp.text:
-                    return resp.json()
-                return {}
+                return resp.json() if resp.text else {}
             except requests.exceptions.Timeout:
-                log.warning(f"[{self.name}] Timeout on {endpoint} (attempt {attempt})")
+                log.warning(f"[{self.name}] Timeout {endpoint} ({attempt}/{self.max_retries})")
             except requests.exceptions.ConnectionError:
-                log.warning(f"[{self.name}] Connection error on {endpoint} (attempt {attempt})")
+                log.warning(f"[{self.name}] ConnError {endpoint} ({attempt}/{self.max_retries})")
             except requests.exceptions.HTTPError as e:
-                log.warning(f"[{self.name}] HTTP error {e} on {endpoint}")
-                return None
+                log.warning(f"[{self.name}] HTTP {e}"); return None
             except Exception as e:
-                log.error(f"[{self.name}] Unexpected error on {endpoint}: {e}")
-                return None
+                log.error(f"[{self.name}] Error on {endpoint}: {e}"); return None
         log.error(f"[{self.name}] Failed after {self.max_retries} retries: {endpoint}")
         return None
 
-    def get(self, endpoint: str, params: dict = None) -> Optional[dict]:
+    def get(self, endpoint, params=None):
         return self._request("GET", endpoint, params=params)
 
-    def get_paginated(self, endpoint: str, params: dict = None,
-                      items_key: str = None) -> List[dict]:
-        """Fetch all pages of a paginated v2 endpoint."""
-        all_items = []
-        params = params or {}
-
+    def get_paginated(self, endpoint, params=None, items_key=None) -> list:
+        all_items, params = [], params or {}
         resp = self.get(endpoint, params)
-        if resp is None:
-            return all_items
-
-        # Auto-detect items key
-        if items_key is None:
-            for candidate in ("entities", "metrics", "records", "problems",
-                              "events", "results", "objects", "activeGates",
-                              "tokens", "slo", "extensions", "monitors",
-                              "networkZones", "hosts", "auditLogs"):
-                if candidate in resp:
-                    items_key = candidate
-                    break
-            if items_key is None:
-                # Return raw response in list
-                return [resp]
-
+        if not resp: return all_items
+        if not items_key:
+            for c in ("entities","metrics","records","problems","events","results",
+                      "objects","activeGates","tokens","slo","extensions","monitors",
+                      "items","networkZones","hosts","auditLogs","types"):
+                if c in resp: items_key = c; break
+            if not items_key: return [resp]
         all_items.extend(resp.get(items_key, []))
-        # Follow pagination
         while resp and resp.get("nextPageKey"):
-            next_params = {**params, "nextPageKey": resp["nextPageKey"]}
-            # Remove other params on subsequent pages per Dynatrace docs
-            for k in list(next_params.keys()):
-                if k not in ("nextPageKey", "pageSize"):
-                    pass  # keep them; v2 ignores extras
-            resp = self.get(endpoint, next_params)
-            if resp and items_key in resp:
-                all_items.extend(resp[items_key])
+            np = {"nextPageKey": resp["nextPageKey"]}
+            if "pageSize" in params: np["pageSize"] = params["pageSize"]
+            resp = self.get(endpoint, np)
+            if resp and items_key in resp: all_items.extend(resp[items_key])
         return all_items
 
-    # ── High-level data collectors ─────────────────────────────────
+    # ── Collectors ──
+    def get_cluster_version(self):
+        r = self.get("/api/v1/config/clusterversion")
+        return r.get("version", "unknown") if r else None
 
-    def get_cluster_version(self) -> Optional[str]:
-        resp = self.get("/api/v1/config/clusterversion")
-        if resp:
-            return resp.get("version", "unknown")
-        return None
+    def get_entities_by_type(self, etype, fields="+properties,+tags,+managementZones,+fromRelationships,+toRelationships"):
+        return self.get_paginated("/api/v2/entities", {"entitySelector": f'type("{etype}")', "fields": fields, "pageSize": 500, "from": "now-72h"}, "entities")
 
-    def get_entities_by_type(self, entity_type: str, fields: str = "+properties,+tags,+managementZones,+fromRelationships,+toRelationships") -> List[dict]:
-        params = {
-            "entitySelector": f'type("{entity_type}")',
-            "fields": fields,
-            "pageSize": 500,
-            "from": "now-72h",
+    def get_problems(self, days=30, status=None):
+        p = {"from": f"now-{days}d", "pageSize": 500, "fields": "+evidenceDetails,+impactAnalysis,+recentComments"}
+        if status: p["problemSelector"] = f'status("{status}")'
+        return self.get_paginated("/api/v2/problems", p, "problems")
+
+    def get_settings(self, schema):
+        return self.get_paginated("/api/v2/settings/objects", {"schemaIds": schema, "scopes": "environment", "pageSize": 500}, "items")
+
+    def get_active_gates(self):   return self.get_paginated("/api/v2/activeGates", {"pageSize": 500}, "activeGates")
+    def get_oneagents(self):      return self.get_paginated("/api/v2/oneAgents", {"pageSize": 500})
+    def get_slos(self):           return self.get_paginated("/api/v2/slo", {"pageSize": 100, "timeFrame": "CURRENT", "evaluate": "true"}, "slo")
+    def get_extensions(self):     return self.get_paginated("/api/v2/extensions", {"pageSize": 100}, "extensions")
+    def get_synthetic(self):      return self.get_paginated("/api/v2/synthetic/monitors", {"pageSize": 500}, "monitors")
+    def get_network_zones(self):
+        r = self.get("/api/v2/networkZones"); return r.get("networkZones", []) if r else []
+    def get_audit_logs(self, days=30):
+        return self.get_paginated("/api/v2/auditlogs", {"from": f"now-{days}d", "pageSize": 500, "filter": 'category("CONFIG")'}, "auditLogs")
+
+    def query_metric(self, key, resolution="1d", from_t="now-30d"):
+        return self.get("/api/v2/metrics/query", {"metricSelector": key, "resolution": resolution, "from": from_t})
+
+    def check_deprecated_v1(self) -> Dict[str, Any]:
+        probes = {
+            "/api/v1/timeseries": "Timeseries v1", "/api/v1/entity/infrastructure/hosts": "Smartscape Hosts",
+            "/api/v1/entity/services": "Smartscape Services", "/api/v1/problem/feed": "Problems v1",
+            "/api/v1/events": "Events v1", "/api/config/v1/autoTags": "Config v1: AutoTags",
+            "/api/config/v1/alertingProfiles": "Config v1: Alerting", "/api/config/v1/notifications": "Config v1: Notifications",
+            "/api/config/v1/managementZones": "Config v1: MgmtZones",
         }
-        return self.get_paginated("/api/v2/entities", params, items_key="entities")
+        return {ep: {"name": n, "accessible": self.get(ep, {"relativeTime": "hour", "pageSize": "1"}) is not None,
+                      "info": DEPRECATED_API_MAP.get(ep.split("?")[0], {})} for ep, n in probes.items()}
 
-    def get_all_entity_types(self) -> List[dict]:
-        return self.get_paginated("/api/v2/entityTypes", {"pageSize": 500}, items_key="types")
-
-    def get_problems(self, days_back: int = 30) -> List[dict]:
-        params = {
-            "from": f"now-{days_back}d",
-            "pageSize": 500,
-            "fields": "+evidenceDetails,+impactAnalysis",
-        }
-        return self.get_paginated("/api/v2/problems", params, items_key="problems")
-
-    def get_settings(self, schema_id: str) -> List[dict]:
-        params = {"schemaIds": schema_id, "pageSize": 500}
-        return self.get_paginated("/api/v2/settings/objects", params, items_key="items")
-
-    def get_active_gates(self) -> List[dict]:
-        return self.get_paginated("/api/v2/activeGates", {"pageSize": 500}, items_key="activeGates")
-
-    def get_oneagents(self) -> List[dict]:
-        params = {"pageSize": 500}
-        return self.get_paginated("/api/v2/oneAgents", params)
-
-    def get_slos(self) -> List[dict]:
-        params = {
-            "pageSize": 100,
-            "timeFrame": "CURRENT",
-            "evaluate": "true",
-        }
-        return self.get_paginated("/api/v2/slo", params, items_key="slo")
-
-    def get_extensions(self) -> List[dict]:
-        return self.get_paginated("/api/v2/extensions", {"pageSize": 100}, items_key="extensions")
-
-    def get_network_zones(self) -> List[dict]:
-        resp = self.get("/api/v2/networkZones")
-        if resp and "networkZones" in resp:
-            return resp["networkZones"]
-        return []
-
-    def get_synthetic_monitors(self) -> List[dict]:
-        return self.get_paginated("/api/v2/synthetic/monitors", {"pageSize": 500}, items_key="monitors")
-
-    def get_audit_logs(self, days_back: int = 30) -> List[dict]:
-        params = {
-            "from": f"now-{days_back}d",
-            "pageSize": 500,
-            "filter": 'category("CONFIG")',
-        }
-        return self.get_paginated("/api/v2/auditlogs", params, items_key="auditLogs")
-
-    def get_alerting_profiles(self) -> List[dict]:
-        return self.get_settings("builtin:alerting.profile")
-
-    def get_notification_rules(self) -> List[dict]:
-        return self.get_settings("builtin:problem.notifications")
-
-    def get_maintenance_windows(self) -> List[dict]:
-        return self.get_settings("builtin:alerting.maintenance-window")
-
-    def get_management_zones(self) -> List[dict]:
-        return self.get_settings("builtin:management-zones")
-
-    def get_auto_tags(self) -> List[dict]:
-        return self.get_settings("builtin:tags.auto-tagging")
-
-    def check_deprecated_v1_access(self) -> Dict[str, Any]:
-        """Probe deprecated v1 endpoints to see if they still respond."""
-        results = {}
-        test_endpoints = {
-            "/api/v1/timeseries": "Timeseries API v1",
-            "/api/v1/entity/infrastructure/hosts": "Topology & Smartscape (Hosts)",
-            "/api/v1/entity/services": "Topology & Smartscape (Services)",
-            "/api/v1/problem/feed": "Problems API v1",
-            "/api/v1/events": "Events API v1",
-        }
-        for endpoint, name in test_endpoints.items():
-            resp = self.get(endpoint, params={"relativeTime": "hour"})
-            results[endpoint] = {
-                "name": name,
-                "accessible": resp is not None,
-                "info": DEPRECATED_API_MAP.get(endpoint.split("?")[0], {}),
-            }
-        return results
-
-    def validate_token_scopes(self) -> Dict[str, bool]:
-        """Check which scopes the current token has."""
-        scope_check = {}
-        test_map = {
+    def validate_token_scopes(self):
+        tests = {
             "entities.read": ("/api/v2/entities", {"entitySelector": 'type("HOST")', "pageSize": 1}),
             "metrics.read": ("/api/v2/metrics", {"pageSize": 1}),
             "problems.read": ("/api/v2/problems", {"pageSize": 1}),
@@ -525,10 +305,7 @@ class DynatraceClient:
             "oneAgents.read": ("/api/v2/oneAgents", {"pageSize": 1}),
             "extensions.read": ("/api/v2/extensions", {"pageSize": 1}),
         }
-        for scope, (endpoint, params) in test_map.items():
-            resp = self.get(endpoint, params)
-            scope_check[scope] = resp is not None
-        return scope_check
+        return {s: self.get(e, p) is not None for s, (e, p) in tests.items()}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -536,1019 +313,627 @@ class DynatraceClient:
 # ═══════════════════════════════════════════════════════════════════
 
 class EnvironmentAnalyzer:
-    """Performs comprehensive analysis on a single Dynatrace environment."""
-
-    def __init__(self, client: DynatraceClient, lookback_days: int = 30):
-        self.client = client
-        self.lookback_days = lookback_days
+    def __init__(self, client: DynatraceClient, lookback_days=30):
+        self.c = client
+        self.days = lookback_days
         self.data: Dict[str, Any] = {}
-        self.gaps: List[Dict[str, str]] = []
-        self.recommendations: List[Dict[str, str]] = []
+        self.gaps: List[Dict] = []
+        self.recs: List[Dict] = []
 
-    def run_full_analysis(self) -> Dict[str, Any]:
-        log.info(f"═══ Analyzing environment: {self.client.name} ═══")
+    def run(self) -> dict:
+        n = self.c.name
+        log.info(f"{'='*55}\n  Analyzing: {n}\n{'='*55}")
+        self._version(); self._scopes(); self._entities(); self._problems()
+        self._activegates(); self._governance(); self._alerting(); self._slos()
+        self._extensions(); self._synthetic(); self._netzones(); self._oneagents()
+        self._ingestion(); self._anomaly_detection(); self._deprecated()
+        self._gap_analysis()
+        log.info(f"[{n}] Done: {len(self.gaps)} gaps, {len(self.recs)} recs, {self.c._call_count} calls")
+        return {"name": n, "url": self.c.base_url, "type": self.c.env_type,
+                "timestamp": datetime.now().isoformat(), "data": self.data,
+                "gaps": self.gaps, "recommendations": self.recs, "api_calls": self.c._call_count}
 
-        # 1. Cluster version
-        log.info(f"[{self.client.name}] Fetching cluster version...")
-        self.data["version"] = self.client.get_cluster_version()
-        log.info(f"[{self.client.name}] Version: {self.data['version']}")
+    def _version(self):
+        log.info(f"[{self.c.name}] Cluster version...")
+        self.data["version"] = self.c.get_cluster_version()
 
-        # 2. Token scope validation
-        log.info(f"[{self.client.name}] Validating token scopes...")
-        self.data["scopes"] = self.client.validate_token_scopes()
+    def _scopes(self):
+        log.info(f"[{self.c.name}] Validating scopes...")
+        self.data["scopes"] = self.c.validate_token_scopes()
         missing = [s for s, ok in self.data["scopes"].items() if not ok]
         if missing:
-            self.gaps.append({
-                "category": "Security",
-                "severity": "HIGH",
-                "finding": f"Token missing scopes: {', '.join(missing)}",
-                "impact": "Incomplete audit — some data inaccessible",
-            })
+            self.gaps.append({"category": "Security", "severity": "HIGH",
+                              "finding": f"Token missing: {', '.join(missing)}", "impact": "Incomplete audit"})
 
-        # 3. Entities (Smartscape topology)
-        log.info(f"[{self.client.name}] Collecting entity topology...")
-        self.data["entities"] = {}
-        entity_counts = {}
-        for etype in SMARTSCAPE_ENTITY_TYPES:
-            entities = self.client.get_entities_by_type(etype)
-            self.data["entities"][etype] = entities
-            entity_counts[etype] = len(entities)
-            log.info(f"[{self.client.name}]   {etype}: {len(entities)} entities")
+    def _entities(self):
+        log.info(f"[{self.c.name}] Entity topology...")
+        self.data["entities"], ec = {}, {}
+        for t in SMARTSCAPE_ENTITY_TYPES:
+            ents = self.c.get_entities_by_type(t)
+            self.data["entities"][t] = ents; ec[t] = len(ents)
+            if ents: log.info(f"[{self.c.name}]   {t}: {len(ents)}")
+        self.data["entity_counts"] = ec
 
-        self.data["entity_counts"] = entity_counts
-
-        # 4. Problems analysis
-        log.info(f"[{self.client.name}] Fetching problems ({self.lookback_days}d)...")
-        self.data["problems"] = self.client.get_problems(self.lookback_days)
-        log.info(f"[{self.client.name}]   {len(self.data['problems'])} problems found")
-        self._analyze_problems()
-
-        # 5. ActiveGates
-        log.info(f"[{self.client.name}] Fetching ActiveGates...")
-        self.data["activegates"] = self.client.get_active_gates()
-        log.info(f"[{self.client.name}]   {len(self.data['activegates'])} ActiveGates")
-        self._analyze_activegates()
-
-        # 6. Management Zones
-        log.info(f"[{self.client.name}] Fetching Management Zones...")
-        self.data["mgmt_zones"] = self.client.get_management_zones()
-
-        # 7. Auto-Tags
-        log.info(f"[{self.client.name}] Fetching Auto-Tag rules...")
-        self.data["auto_tags"] = self.client.get_auto_tags()
-
-        # 8. Alerting Profiles & Notifications
-        log.info(f"[{self.client.name}] Fetching Alerting config...")
-        self.data["alerting_profiles"] = self.client.get_alerting_profiles()
-        self.data["notifications"] = self.client.get_notification_rules()
-        self._analyze_alerting()
-
-        # 9. Maintenance Windows
-        log.info(f"[{self.client.name}] Fetching Maintenance Windows...")
-        self.data["maintenance_windows"] = self.client.get_maintenance_windows()
-
-        # 10. SLOs
-        log.info(f"[{self.client.name}] Fetching SLOs...")
-        self.data["slos"] = self.client.get_slos()
-        self._analyze_slos()
-
-        # 11. Extensions
-        log.info(f"[{self.client.name}] Fetching Extensions 2.0...")
-        self.data["extensions"] = self.client.get_extensions()
-
-        # 12. Synthetic Monitors
-        log.info(f"[{self.client.name}] Fetching Synthetic Monitors...")
-        self.data["synthetic"] = self.client.get_synthetic_monitors()
-
-        # 13. Network Zones
-        log.info(f"[{self.client.name}] Fetching Network Zones...")
-        self.data["network_zones"] = self.client.get_network_zones()
-
-        # 14. Deprecated API probe
-        log.info(f"[{self.client.name}] Probing deprecated v1 endpoints...")
-        self.data["deprecated_apis"] = self.client.check_deprecated_v1_access()
-        self._analyze_deprecated_apis()
-
-        # 15. OneAgent analysis
-        log.info(f"[{self.client.name}] Fetching OneAgent info...")
-        self.data["oneagents"] = self.client.get_oneagents()
-        self._analyze_oneagents()
-
-        # 16. Gap analysis for observability coverage
-        self._run_gap_analysis()
-
-        log.info(f"[{self.client.name}] Analysis complete. "
-                 f"{len(self.gaps)} gaps, {len(self.recommendations)} recommendations. "
-                 f"API calls: {self.client._call_count}")
-
-        return {
-            "name": self.client.name,
-            "url": self.client.base_url,
-            "type": self.client.env_type,
-            "data": self.data,
-            "gaps": self.gaps,
-            "recommendations": self.recommendations,
-            "api_calls": self.client._call_count,
-        }
-
-    # ── Sub-analyzers ──────────────────────────────────────────────
-
-    def _analyze_problems(self):
-        problems = self.data.get("problems", [])
-        if not problems:
-            return
-        status_counts = defaultdict(int)
-        severity_counts = defaultdict(int)
-        for p in problems:
-            status_counts[p.get("status", "UNKNOWN")] += 1
-            severity_counts[p.get("severityLevel", "UNKNOWN")] += 1
+    def _problems(self):
+        log.info(f"[{self.c.name}] Problems ({self.days}d)...")
+        probs = self.c.get_problems(self.days)
+        self.data["problems_raw"] = probs
+        st, sv, noise = defaultdict(int), defaultdict(int), defaultdict(int)
+        for p in probs:
+            st[p.get("status", "?")] += 1; sv[p.get("severityLevel", "?")] += 1
+            noise[p.get("title", "?")] += 1
+        oc = st.get("OPEN", 0)
+        top_noise = sorted(noise.items(), key=lambda x: -x[1])[:15]
         self.data["problem_stats"] = {
-            "total": len(problems),
-            "by_status": dict(status_counts),
-            "by_severity": dict(severity_counts),
-        }
-        open_count = status_counts.get("OPEN", 0)
-        if open_count > 20:
-            self.gaps.append({
-                "category": "Problem Management",
-                "severity": "HIGH",
-                "finding": f"{open_count} open problems — noise or unresolved issues",
-                "impact": "Alert fatigue, missed critical issues in GxP environment",
-            })
-            self.recommendations.append({
-                "category": "Problem Management",
-                "priority": "P1",
-                "action": "Implement problem noise-reduction: tune anomaly detection thresholds, "
-                          "create Davis AI-driven baselines, review alerting profiles",
-                "effort": "Medium",
-            })
+            "total": len(probs), "by_status": dict(st), "by_severity": dict(sv),
+            "open_count": oc, "top_noise_sources": top_noise,
+            "top_open": [{"title": p.get("title","?"), "severity": p.get("severityLevel","?"),
+                          "status": p.get("status","?")} for p in probs if p.get("status") == "OPEN"][:20]}
+        self.data["davis_ai_summary"] = (
+            f"{len(probs)} problems ({self.days}d). {oc} open. "
+            f"Top noise: '{top_noise[0][0][:50]}' ({top_noise[0][1]}x)" if top_noise
+            else f"No problems in {self.days}d.")
+        if oc > 20:
+            self.gaps.append({"category": "Problem Mgmt", "severity": "HIGH",
+                              "finding": f"{oc} open problems", "impact": "Alert fatigue in GxP env"})
+            self.recs.append({"category": "Problem Mgmt", "priority": "P1",
+                              "action": "Tune anomaly detection, review alerting profiles, suppress noise", "effort": "Medium"})
+        if top_noise and top_noise[0][1] >= 10:
+            self.gaps.append({"category": "Noise", "severity": "MEDIUM",
+                              "finding": f"'{top_noise[0][0][:45]}' recurred {top_noise[0][1]}x", "impact": "Alert fatigue"})
+            self.recs.append({"category": "Noise", "priority": "P1",
+                              "action": f"Tune/suppress: '{top_noise[0][0][:45]}'", "effort": "Low"})
 
-    def _analyze_activegates(self):
-        ags = self.data.get("activegates", [])
+    def _activegates(self):
+        log.info(f"[{self.c.name}] ActiveGates...")
+        ags = self.c.get_active_gates(); self.data["activegates"] = ags
         if not ags:
-            self.gaps.append({
-                "category": "Infrastructure",
-                "severity": "MEDIUM",
-                "finding": "No ActiveGates detected (or no read access)",
-                "impact": "Cannot verify AG health, version, or routing",
-            })
-            return
-        outdated = []
-        for ag in ags:
-            ver = ag.get("version", "")
-            modules = ag.get("modules", [])
-            if ag.get("autoUpdateStatus") == "OUTDATED":
-                outdated.append(ag.get("hostname", "unknown"))
-        if outdated:
-            self.gaps.append({
-                "category": "Infrastructure",
-                "severity": "HIGH",
-                "finding": f"{len(outdated)} ActiveGate(s) running outdated versions",
-                "impact": "Security risk, missing latest features & patches",
-            })
-            self.recommendations.append({
-                "category": "Infrastructure",
-                "priority": "P1",
-                "action": f"Update ActiveGates: {', '.join(outdated[:5])}{'...' if len(outdated)>5 else ''}",
-                "effort": "Low",
-            })
+            self.gaps.append({"category": "Infra", "severity": "MEDIUM",
+                              "finding": "No ActiveGates", "impact": "Cannot verify AG health"}); return
+        bad = [a.get("hostname","?") for a in ags if a.get("autoUpdateStatus") == "OUTDATED"]
+        if bad:
+            self.gaps.append({"category": "Infra", "severity": "HIGH",
+                              "finding": f"{len(bad)} AG(s) outdated", "impact": "Security risk"})
+            self.recs.append({"category": "Infra", "priority": "P1",
+                              "action": f"Update: {', '.join(bad[:5])}", "effort": "Low"})
 
-    def _analyze_alerting(self):
-        profiles = self.data.get("alerting_profiles", [])
-        notifications = self.data.get("notifications", [])
-        if not profiles:
-            self.gaps.append({
-                "category": "Alerting",
-                "severity": "HIGH",
-                "finding": "No alerting profiles configured (or inaccessible)",
-                "impact": "Default alerting may cause noise; no severity filtering",
-            })
-        if not notifications:
-            self.gaps.append({
-                "category": "Alerting",
-                "severity": "CRITICAL",
-                "finding": "No notification rules configured",
-                "impact": "Problems detected but nobody is notified — silent failures",
-            })
-            self.recommendations.append({
-                "category": "Alerting",
-                "priority": "P0",
-                "action": "Configure notification integrations (PagerDuty, ServiceNow, email) "
-                          "with proper routing and escalation",
-                "effort": "Medium",
-            })
+    def _governance(self):
+        log.info(f"[{self.c.name}] Governance config...")
+        self.data["mgmt_zones"] = self.c.get_settings("builtin:management-zones")
+        self.data["auto_tags"] = self.c.get_settings("builtin:tags.auto-tagging")
 
-    def _analyze_slos(self):
-        slos = self.data.get("slos", [])
+    def _alerting(self):
+        log.info(f"[{self.c.name}] Alerting config...")
+        self.data["alerting_profiles"] = self.c.get_settings("builtin:alerting.profile")
+        self.data["notifications"] = self.c.get_settings("builtin:problem.notifications")
+        self.data["maintenance_windows"] = self.c.get_settings("builtin:alerting.maintenance-window")
+        # Build alert list
+        self.data["all_alerts_configured"] = [
+            f"profile: {i.get('value',{}).get('name', i.get('value',{}).get('displayName','?'))}"
+            for i in self.data["alerting_profiles"]]
+        if not self.data["alerting_profiles"]:
+            self.gaps.append({"category": "Alerting", "severity": "HIGH",
+                              "finding": "No alerting profiles", "impact": "Noise from defaults"})
+        if not self.data["notifications"]:
+            self.gaps.append({"category": "Alerting", "severity": "CRITICAL",
+                              "finding": "No notification rules", "impact": "Silent failures"})
+            self.recs.append({"category": "Alerting", "priority": "P0",
+                              "action": "Configure PagerDuty/ServiceNow/email notifications", "effort": "Medium"})
+
+    def _slos(self):
+        log.info(f"[{self.c.name}] SLOs...")
+        slos = self.c.get_slos(); self.data["slos"] = slos
         if not slos:
-            self.gaps.append({
-                "category": "SLO / SRE",
-                "severity": "MEDIUM",
-                "finding": "No SLOs defined in this environment",
-                "impact": "No measurable reliability targets — weak SRE posture",
-            })
-            self.recommendations.append({
-                "category": "SLO / SRE",
-                "priority": "P2",
-                "action": "Define SLOs for critical services (availability, error rate, "
-                          "response time). Start with golden signals.",
-                "effort": "Medium",
-            })
+            self.gaps.append({"category": "SLO/SRE", "severity": "MEDIUM",
+                              "finding": "No SLOs defined", "impact": "No reliability targets"})
+            self.recs.append({"category": "SLO/SRE", "priority": "P2",
+                              "action": "Define SLOs for critical services", "effort": "Medium"})
         else:
-            breached = [s for s in slos if s.get("evaluatedPercentage", 100) < s.get("target", 99)]
+            breached = [s for s in slos if isinstance(s.get("evaluatedPercentage"), (int,float))
+                        and isinstance(s.get("target"), (int,float)) and s["evaluatedPercentage"] < s["target"]]
             if breached:
-                self.gaps.append({
-                    "category": "SLO / SRE",
-                    "severity": "HIGH",
-                    "finding": f"{len(breached)} SLO(s) currently breaching target",
-                    "impact": "Reliability targets not being met",
-                })
+                self.gaps.append({"category": "SLO/SRE", "severity": "HIGH",
+                                  "finding": f"{len(breached)} SLO(s) breaching", "impact": "Targets not met"})
 
-    def _analyze_deprecated_apis(self):
-        dep = self.data.get("deprecated_apis", {})
-        for endpoint, info in dep.items():
-            if info.get("accessible"):
-                api_info = info.get("info", {})
-                self.gaps.append({
-                    "category": "API Deprecation",
-                    "severity": api_info.get("severity", "MEDIUM"),
-                    "finding": f"Deprecated endpoint still accessible: {endpoint}",
-                    "impact": f"EOL: {api_info.get('eol', 'TBD')} — migrate to {api_info.get('replacement', 'v2 equivalent')}",
-                })
-        # Always recommend migration check
-        self.recommendations.append({
-            "category": "API Deprecation",
-            "priority": "P1",
-            "action": "Audit all automation scripts and integrations for v1 API usage. "
-                      "Migrate Timeseries→Metrics v2, Topology→Entities v2, "
-                      "Problems v1→v2, Events v1→v2, Config v1→Settings 2.0.",
-            "effort": "High",
-        })
+    def _extensions(self):
+        log.info(f"[{self.c.name}] Extensions 2.0...")
+        self.data["extensions"] = self.c.get_extensions()
 
-    def _analyze_oneagents(self):
-        agents = self.data.get("oneagents", [])
-        if isinstance(agents, list) and len(agents) > 0:
-            # Check for items that may be dicts
-            outdated = []
-            for a in agents:
-                if isinstance(a, dict):
-                    status = a.get("updateStatus", "")
-                    if status in ("OUTDATED", "SUPPRESSED"):
-                        host_info = a.get("hostInfo", {})
-                        outdated.append(host_info.get("displayName", "unknown"))
-            if outdated:
-                self.gaps.append({
-                    "category": "Agent Management",
-                    "severity": "HIGH",
-                    "finding": f"{len(outdated)} OneAgent(s) outdated or update-suppressed",
-                    "impact": "Missing security patches and new features",
-                })
-                self.recommendations.append({
-                    "category": "Agent Management",
-                    "priority": "P1",
-                    "action": "Enable OneAgent auto-update or schedule update windows "
-                              "for outdated agents in compliance with GxP change control",
-                    "effort": "Medium",
-                })
+    def _synthetic(self):
+        log.info(f"[{self.c.name}] Synthetic...")
+        self.data["synthetic"] = self.c.get_synthetic()
 
-    def _run_gap_analysis(self):
-        """Cross-cutting observability gap analysis."""
+    def _netzones(self):
+        log.info(f"[{self.c.name}] Network Zones...")
+        self.data["network_zones"] = self.c.get_network_zones()
+
+    def _oneagents(self):
+        log.info(f"[{self.c.name}] OneAgents...")
+        agents = self.c.get_oneagents(); self.data["oneagents"] = agents
+        if isinstance(agents, list) and agents:
+            bad = [a.get("hostInfo",{}).get("displayName","?") for a in agents
+                   if isinstance(a, dict) and a.get("updateStatus") in ("OUTDATED","SUPPRESSED")]
+            if bad:
+                self.gaps.append({"category": "Agents", "severity": "HIGH",
+                                  "finding": f"{len(bad)} OA outdated/suppressed", "impact": "Missing patches"})
+                self.recs.append({"category": "Agents", "priority": "P1",
+                                  "action": "Enable auto-update per GxP change control", "effort": "Medium"})
+
+    def _ingestion(self):
+        log.info(f"[{self.c.name}] Ingestion metrics...")
+        ing = {}
+        for name, key in INGESTION_METRICS.items():
+            try:
+                r = self.c.query_metric(key, "1d", f"now-{self.days}d")
+                total = 0.0
+                if r and "result" in r:
+                    for s in r["result"]:
+                        for d in s.get("data", []):
+                            total += sum(v for v in d.get("values", []) if v is not None)
+                ing[name] = round(total, 2)
+            except: ing[name] = 0
+        self.data["ingestion"] = ing
+
+    def _anomaly_detection(self):
+        log.info(f"[{self.c.name}] Anomaly detection...")
+        ad = {}
+        for schema in ANOMALY_SCHEMAS:
+            objs = self.c.get_settings(schema)
+            short = schema.split(".")[-1]
+            ad[short] = len(objs)
+            self.data["all_alerts_configured"].extend(
+                [f"anomaly.{short}: {o.get('value',{}).get('name', o.get('value',{}).get('displayName','?'))}"
+                 for o in objs][:25])
+        self.data["anomaly_detection"] = ad
+
+    def _deprecated(self):
+        log.info(f"[{self.c.name}] Probing deprecated APIs...")
+        dep = self.c.check_deprecated_v1(); self.data["deprecated_apis"] = dep
+        for ep, info in dep.items():
+            if info["accessible"]:
+                ai = info.get("info", {})
+                self.gaps.append({"category": "API Deprecation", "severity": ai.get("severity","MEDIUM"),
+                                  "finding": f"Deprecated: {ep}", "impact": f"EOL:{ai.get('eol','TBD')} → {ai.get('replacement','v2')}"})
+        self.recs.append({"category": "API Deprecation", "priority": "P1",
+                          "action": "Audit scripts for v1 usage. Migrate to v2/Settings 2.0.", "effort": "High"})
+
+    def _gap_analysis(self):
         ec = self.data.get("entity_counts", {})
-
-        # No hosts monitored
         if ec.get("HOST", 0) == 0:
-            self.gaps.append({
-                "category": "Coverage",
-                "severity": "CRITICAL",
-                "finding": "No hosts detected — infrastructure monitoring gap",
-                "impact": "Zero visibility into server health",
-            })
-
-        # Services but no applications
+            self.gaps.append({"category": "Coverage", "severity": "CRITICAL",
+                              "finding": "No hosts", "impact": "Zero infra visibility"})
         if ec.get("SERVICE", 0) > 0 and ec.get("APPLICATION", 0) == 0:
-            self.gaps.append({
-                "category": "Coverage",
-                "severity": "MEDIUM",
-                "finding": "Services monitored but no RUM/Applications configured",
-                "impact": "No end-user experience visibility",
-            })
-            self.recommendations.append({
-                "category": "Coverage",
-                "priority": "P2",
-                "action": "Enable Real User Monitoring (RUM) for web applications "
-                          "to capture user experience metrics",
-                "effort": "Low",
-            })
-
-        # No synthetic monitoring
+            self.gaps.append({"category": "Coverage", "severity": "MEDIUM",
+                              "finding": "No RUM Applications", "impact": "No UX visibility"})
+            self.recs.append({"category": "Coverage", "priority": "P2", "action": "Enable RUM", "effort": "Low"})
         if ec.get("HTTP_CHECK", 0) == 0 and ec.get("BROWSER_MONITOR", 0) == 0:
-            self.gaps.append({
-                "category": "Coverage",
-                "severity": "MEDIUM",
-                "finding": "No synthetic monitors configured",
-                "impact": "No proactive availability monitoring",
-            })
-            self.recommendations.append({
-                "category": "Coverage",
-                "priority": "P2",
-                "action": "Set up HTTP check monitors for critical endpoints "
-                          "and browser-click monitors for key user journeys",
-                "effort": "Medium",
-            })
-
-        # Management zones
-        mz = self.data.get("mgmt_zones", [])
-        if not mz:
-            self.gaps.append({
-                "category": "Governance",
-                "severity": "MEDIUM",
-                "finding": "No management zones defined",
-                "impact": "No data segmentation — everyone sees everything (RBAC gap in GxP)",
-            })
-            self.recommendations.append({
-                "category": "Governance",
-                "priority": "P1",
-                "action": "Define management zones aligned to application tiers, "
-                          "business units, or GxP validation boundaries",
-                "effort": "Medium",
-            })
-
-        # Auto-tags
-        tags = self.data.get("auto_tags", [])
-        if len(tags) < 3:
-            self.recommendations.append({
-                "category": "Governance",
-                "priority": "P2",
-                "action": "Implement auto-tagging strategy: environment, tier, owner, "
-                          "cost-center, GxP-classification tags",
-                "effort": "Medium",
-            })
-
-        # Network zones
-        nz = self.data.get("network_zones", [])
-        if not nz:
-            self.recommendations.append({
-                "category": "Network",
-                "priority": "P3",
-                "action": "Consider network zones for segmented traffic routing "
-                          "through ActiveGates (useful for DMZ/airgapped segments)",
-                "effort": "Low",
-            })
+            self.gaps.append({"category": "Coverage", "severity": "MEDIUM",
+                              "finding": "No synthetic monitors", "impact": "No proactive checks"})
+            self.recs.append({"category": "Coverage", "priority": "P2",
+                              "action": "Create HTTP checks for critical endpoints", "effort": "Medium"})
+        if not self.data.get("mgmt_zones"):
+            self.gaps.append({"category": "Governance", "severity": "MEDIUM",
+                              "finding": "No management zones", "impact": "No RBAC segmentation (GxP)"})
+            self.recs.append({"category": "Governance", "priority": "P1",
+                              "action": "Define MZs for app tiers/GxP boundaries", "effort": "Medium"})
+        if len(self.data.get("auto_tags", [])) < 3:
+            self.recs.append({"category": "Governance", "priority": "P2",
+                              "action": "Auto-tagging: env, tier, owner, cost-center, GxP-class", "effort": "Medium"})
+        if not self.data.get("network_zones"):
+            self.recs.append({"category": "Network", "priority": "P3",
+                              "action": "Consider network zones for DMZ routing", "effort": "Low"})
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  SMARTSCAPE DIAGRAM GENERATOR
+#  SMARTSCAPE DIAGRAM
 # ═══════════════════════════════════════════════════════════════════
 
 class SmartscapeDiagram:
-    """Generates a Smartscape-like architecture diagram using Graphviz."""
-
-    LAYER_CONFIG = {
-        "APPLICATION":    {"rank": 0, "color": "#6F2DA8", "shape": "doubleoctagon", "label": "Applications"},
-        "SERVICE":        {"rank": 1, "color": "#1496FF", "shape": "component",     "label": "Services"},
-        "PROCESS_GROUP":  {"rank": 2, "color": "#2AB06F", "shape": "box3d",         "label": "Process Groups"},
-        "HOST":           {"rank": 3, "color": "#FF6A00", "shape": "box",           "label": "Hosts"},
-        "KUBERNETES_CLUSTER": {"rank": 3, "color": "#326CE5", "shape": "tab",       "label": "K8s Clusters"},
+    LAYERS = {
+        "APPLICATION": {"color": "#6F2DA8", "shape": "doubleoctagon", "label": "Applications"},
+        "SERVICE": {"color": "#1496FF", "shape": "component", "label": "Services"},
+        "PROCESS_GROUP": {"color": "#2AB06F", "shape": "box3d", "label": "Process Groups"},
+        "HOST": {"color": "#FF6A00", "shape": "box", "label": "Hosts"},
+        "KUBERNETES_CLUSTER": {"color": "#326CE5", "shape": "tab", "label": "K8s Clusters"},
     }
 
-    def __init__(self, env_name: str, entities: Dict[str, List[dict]], output_dir: str):
-        self.env_name = env_name
-        self.entities = entities
-        self.output_dir = output_dir
+    def __init__(self, env, entities, outdir):
+        self.env, self.entities, self.outdir = env, entities, outdir
 
     def generate(self) -> Optional[str]:
-        """Generate Smartscape diagram and return the file path."""
-        dot = graphviz.Digraph(
-            name=f"smartscape_{self.env_name}",
-            format="png",
-            engine="dot",
-        )
-        dot.attr(
-            rankdir="TB",
-            bgcolor="#1A1A2E",
-            fontcolor="white",
-            fontname="Helvetica",
-            label=f"Smartscape Topology — {self.env_name}",
-            labelloc="t",
-            fontsize="20",
-            pad="0.5",
-            nodesep="0.4",
-            ranksep="0.8",
-            dpi="150",
-        )
+        dot = graphviz.Digraph(name=f"smartscape_{self.env}", format="png", engine="dot")
+        dot.attr(rankdir="TB", bgcolor="#1A1A2E", fontcolor="white", fontname="Helvetica",
+                 label=f"Smartscape — {self.env}", labelloc="t", fontsize="20", dpi="150",
+                 pad="0.5", nodesep="0.4", ranksep="0.8")
         dot.attr("node", fontname="Helvetica", fontsize="9", fontcolor="white", style="filled")
         dot.attr("edge", color="#555555", arrowsize="0.6", penwidth="0.8")
-
-        entity_id_map = {}  # entityId → node_id
-
-        # Build nodes per layer
-        for etype, config in self.LAYER_CONFIG.items():
+        id_map = {}
+        for etype, cfg in self.LAYERS.items():
             items = self.entities.get(etype, [])
-            if not items:
-                continue
-
-            # Limit display to top 30 per layer for readability
-            display_items = items[:30]
-            overflow = len(items) - len(display_items)
-
-            with dot.subgraph(name=f"cluster_{etype}") as sub:
-                sub.attr(
-                    label=f"{config['label']} ({len(items)})",
-                    style="dashed",
-                    color=config["color"],
-                    fontcolor=config["color"],
-                    fontsize="12",
-                )
-
-                for entity in display_items:
-                    eid = entity.get("entityId", "")
-                    name = entity.get("displayName", eid)[:40]
-                    node_id = eid.replace("-", "_").replace(".", "_")
-                    entity_id_map[eid] = node_id
-
-                    # Truncate long names
-                    label = name if len(name) <= 30 else name[:27] + "..."
-
-                    sub.node(
-                        node_id,
-                        label=label,
-                        shape=config["shape"],
-                        fillcolor=config["color"],
-                        color=config["color"],
-                    )
-
-                if overflow > 0:
-                    sub.node(
-                        f"overflow_{etype}",
-                        label=f"... +{overflow} more",
-                        shape="plaintext",
-                        fontcolor=config["color"],
-                        fillcolor="#1A1A2E",
-                    )
-
-        # Build edges from relationships
-        edge_count = 0
-        max_edges = 200  # Cap for readability
-        for etype, items in self.entities.items():
-            for entity in items:
-                eid = entity.get("entityId", "")
-                src = entity_id_map.get(eid)
-                if not src:
-                    continue
-                # "calls" and "runsOn" relationships
-                for rel_type in ("calls", "runsOn", "isProcessOf", "runs", "contains"):
-                    rels = entity.get("fromRelationships", {}).get(rel_type, [])
-                    for rel in rels:
-                        target_id = rel.get("id", "") if isinstance(rel, dict) else rel
-                        tgt = entity_id_map.get(target_id)
-                        if tgt and edge_count < max_edges:
-                            dot.edge(src, tgt, color="#555555AA")
-                            edge_count += 1
-
-        # Render
+            if not items: continue
+            show, overflow = items[:30], max(0, len(items)-30)
+            with dot.subgraph(name=f"cluster_{etype}") as s:
+                s.attr(label=f"{cfg['label']} ({len(items)})", style="dashed",
+                       color=cfg["color"], fontcolor=cfg["color"], fontsize="12")
+                for e in show:
+                    eid = e.get("entityId",""); nid = eid.replace("-","_").replace(".","_")
+                    id_map[eid] = nid
+                    lbl = e.get("displayName", eid)[:30]
+                    s.node(nid, label=lbl, shape=cfg["shape"], fillcolor=cfg["color"], color=cfg["color"])
+                if overflow:
+                    s.node(f"ov_{etype}", label=f"+{overflow} more", shape="plaintext",
+                           fontcolor=cfg["color"], fillcolor="#1A1A2E")
+        edges = 0
+        for items in self.entities.values():
+            for e in items:
+                src = id_map.get(e.get("entityId",""))
+                if not src: continue
+                for rt in ("calls","runsOn","isProcessOf","runs","contains"):
+                    for r in e.get("fromRelationships",{}).get(rt,[]):
+                        tid = r.get("id","") if isinstance(r, dict) else r
+                        tgt = id_map.get(tid)
+                        if tgt and edges < 200: dot.edge(src, tgt, color="#555555AA"); edges += 1
         try:
-            output_path = os.path.join(self.output_dir, f"smartscape_{self.env_name}")
-            dot.render(output_path, cleanup=True)
-            log.info(f"[{self.env_name}] Smartscape diagram saved: {output_path}.png")
-            return f"{output_path}.png"
+            p = os.path.join(self.outdir, f"smartscape_{self.env}")
+            dot.render(p, cleanup=True); return f"{p}.png"
         except Exception as e:
-            log.error(f"[{self.env_name}] Diagram generation failed: {e}")
-            return None
+            log.error(f"Diagram failed: {e}"); return None
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  PDF REPORT GENERATOR
+#  HTML DASHBOARD (merged from main_pdf.py)
 # ═══════════════════════════════════════════════════════════════════
 
-class ReportGenerator:
-    """Generates a comprehensive PDF report with all findings."""
+class HTMLDashboard:
+    def __init__(self, results, outdir, diagrams):
+        self.results, self.outdir, self.diagrams = results, outdir, diagrams
 
-    def __init__(self, results: List[dict], output_path: str, diagrams: Dict[str, str]):
-        self.results = results
-        self.output_path = output_path
-        self.diagrams = diagrams
+    def generate(self) -> str:
+        envs = [r["name"] for r in self.results]
+        snap = json.dumps([{"Env": r["name"], "Hosts": r["data"].get("entity_counts",{}).get("HOST",0),
+                            "Services": r["data"].get("entity_counts",{}).get("SERVICE",0),
+                            "Apps": r["data"].get("entity_counts",{}).get("APPLICATION",0),
+                            "AGs": len(r["data"].get("activegates",[])),
+                            "PGs": r["data"].get("entity_counts",{}).get("PROCESS_GROUP",0)} for r in self.results])
+        probs = json.dumps([{"env": r["name"], "open": r["data"].get("problem_stats",{}).get("open_count",0)} for r in self.results])
+        noise = "[]"
+        for r in self.results:
+            ns = r["data"].get("problem_stats",{}).get("top_noise_sources",[])
+            if ns: noise = json.dumps([{"t": t[:50], "c": c} for t,c in ns[:10]]); break
+        ing = json.dumps([{"env": r["name"], **r["data"].get("ingestion",{})} for r in self.results])
+        gaps = json.dumps([{"env": r["name"], **g} for r in self.results for g in r["gaps"]])
+        recs = json.dumps([{"env": r["name"], **rc} for r in self.results for rc in r["recommendations"]])
+        davis = "".join(f'<div class="alert alert-info mb-2"><b>{r["name"]}:</b> {r["data"].get("davis_ai_summary","N/A")}</div>' for r in self.results)
+        alerts = "".join(f'<li class="list-group-item py-1 small">[{r["name"]}] {a}</li>' for r in self.results for a in r["data"].get("all_alerts_configured",[])[:20])
+        imgs = "".join(f'<div class="col-md-4 mb-3"><h6>{n}</h6><img src="{os.path.basename(p)}" class="img-fluid shadow rounded"></div>' for n,p in self.diagrams.items() if p and os.path.exists(p))
+        gap_matrix = json.dumps([{"Env":r["name"], "MZ":len(r["data"].get("mgmt_zones",[])),
+                                   "Open":r["data"].get("problem_stats",{}).get("open_count",0),
+                                   "SLOs":len(r["data"].get("slos",[])), "Synth":len(r["data"].get("synthetic",[])),
+                                   "Tags":len(r["data"].get("auto_tags",[])), "Gaps":len(r["gaps"])} for r in self.results])
+
+        html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DT Audit v4.0</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>body{{background:#f0f2f5;font-family:'Segoe UI',sans-serif}}.nav-tabs .nav-link{{color:#6F2DA8}}.nav-tabs .nav-link.active{{background:#6F2DA8;color:#fff;border-color:#6F2DA8}}.severity-CRITICAL{{color:#DC172A;font-weight:700}}.severity-HIGH{{color:#FF6A00;font-weight:700}}.severity-MEDIUM{{color:#1496FF}}.table th{{background:#6F2DA8;color:#fff;font-size:.8rem}}.table td{{font-size:.8rem}}</style></head>
+<body class="p-4"><div class="container-fluid">
+<h2 class="text-center mb-1" style="color:#6F2DA8">Dynatrace Audit v4.0</h2>
+<p class="text-center text-muted mb-3">{datetime.now().strftime('%B %d, %Y %H:%M')}</p>
+<ul class="nav nav-tabs mb-3" id="t" role="tablist">
+<li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#ov">Overview</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#dv">Davis AI</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#ns">Noise</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#al">Alerts</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#ig">Ingestion</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#gp">Gaps</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#rc">Recs</a></li>
+<li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#ss">Smartscape</a></li></ul>
+<div class="tab-content">
+<div class="tab-pane fade show active" id="ov"><div class="row"><div class="col-md-6"><div id="cp"></div></div><div class="col-md-6"><div id="ce"></div></div></div><div id="ts" class="mt-3"></div></div>
+<div class="tab-pane fade" id="dv"><h5>Davis AI</h5>{davis}</div>
+<div class="tab-pane fade" id="ns"><div class="row"><div class="col-md-8"><div id="cn"></div></div><div class="col-md-4"><div class="card p-3 mt-4"><h6>Action</h6><p class="small">Tune anomaly rules or suppress recurring noise.</p></div></div></div></div>
+<div class="tab-pane fade" id="al"><h5>Configured Alerts</h5><ul class="list-group">{alerts or '<li class="list-group-item">None</li>'}</ul></div>
+<div class="tab-pane fade" id="ig"><div id="ci"></div></div>
+<div class="tab-pane fade" id="gp"><h5>Gap Matrix</h5><div id="tgm"></div><h5 class="mt-3">All Gaps</h5><div id="tg"></div></div>
+<div class="tab-pane fade" id="rc"><h5>Recommendations</h5><div id="tr"></div></div>
+<div class="tab-pane fade" id="ss"><div class="row">{imgs or '<p class="col-12 text-muted">No diagrams.</p>'}</div></div>
+</div></div>
+<script>
+const P={probs},S={snap},N={noise},I={ing},G={gaps},R={recs},GM={gap_matrix};
+Plotly.newPlot('cp',[{{values:P.map(d=>d.open),labels:P.map(d=>d.env),type:'pie',marker:{{colors:['#6F2DA8','#1496FF','#2AB06F','#FF6A00']}}}}],{{title:'Open Problems',height:320}});
+Plotly.newPlot('ce',[{{x:S.map(d=>d.Env),y:S.map(d=>d.Hosts),name:'Hosts',type:'bar'}},{{x:S.map(d=>d.Env),y:S.map(d=>d.Services),name:'Svc',type:'bar'}},{{x:S.map(d=>d.Env),y:S.map(d=>d.Apps),name:'App',type:'bar'}}],{{title:'Entities',barmode:'group',height:320}});
+if(N.length)Plotly.newPlot('cn',[{{x:N.map(d=>d.t),y:N.map(d=>d.c),type:'bar',marker:{{color:'#FF6A00'}}}}],{{title:'Top Noise',height:350,xaxis:{{tickangle:-25}}}});
+if(I.length){{const ks=Object.keys(I[0]).filter(k=>k!=='env');Plotly.newPlot('ci',ks.map(k=>({{x:I.map(d=>d.env),y:I.map(d=>d[k]||0),name:k,type:'bar'}})),{{title:'Ingestion (30d)',barmode:'group',height:350}})}}
+function rt(id,d){{if(!d.length){{document.getElementById(id).innerHTML='<p>No data</p>';return}}let h='<table class="table table-sm table-bordered"><thead><tr>';Object.keys(d[0]).forEach(k=>h+='<th>'+k+'</th>');h+='</tr></thead><tbody>';d.forEach(r=>{{h+='<tr>';Object.entries(r).forEach(([k,v])=>{{let c=k==='severity'?'severity-'+v:'';h+='<td class="'+c+'">'+v+'</td>'}});h+='</tr>'}});h+='</tbody></table>';document.getElementById(id).innerHTML=h}}
+rt('ts',S);rt('tgm',GM);rt('tg',G);rt('tr',R);
+</script></body></html>"""
+        out = os.path.join(self.outdir, "dashboard_v4.0.html")
+        with open(out, "w", encoding="utf-8") as f: f.write(html)
+        log.info(f"HTML: {out}"); return out
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PDF REPORT
+# ═══════════════════════════════════════════════════════════════════
+
+class PDFReport:
+    def __init__(self, results, path, diagrams):
+        self.results, self.path, self.diagrams = results, path, diagrams
         self.styles = getSampleStyleSheet()
-        self._setup_styles()
+        for name, kw in [
+            ("CoverTitle", {"fontSize": 28, "textColor": colors.HexColor(DT_PURPLE), "spaceAfter": 20, "alignment": TA_CENTER}),
+            ("CoverSub", {"fontSize": 14, "textColor": colors.HexColor("#666"), "alignment": TA_CENTER, "spaceAfter": 10}),
+            ("SH", {"parent": self.styles["Heading1"], "fontSize": 16, "textColor": colors.HexColor(DT_PURPLE), "spaceBefore": 16, "spaceAfter": 8}),
+            ("SS", {"parent": self.styles["Heading2"], "fontSize": 13, "textColor": colors.HexColor(DT_BLUE), "spaceBefore": 10, "spaceAfter": 6}),
+            ("BT", {"fontSize": 9, "leading": 12, "spaceAfter": 4}),
+            ("SN", {"fontSize": 7, "textColor": colors.HexColor("#999")}),
+            ("CT", {"fontSize": 8, "leading": 10}),
+        ]:
+            parent = kw.pop("parent", self.styles["Normal"])
+            self.styles.add(ParagraphStyle(name, parent=parent, **kw))
 
-    def _setup_styles(self):
-        self.styles.add(ParagraphStyle(
-            "CoverTitle", parent=self.styles["Title"],
-            fontSize=28, textColor=colors.HexColor(DT_PURPLE),
-            spaceAfter=20, alignment=TA_CENTER,
-        ))
-        self.styles.add(ParagraphStyle(
-            "CoverSub", parent=self.styles["Normal"],
-            fontSize=14, textColor=colors.HexColor("#666666"),
-            alignment=TA_CENTER, spaceAfter=10,
-        ))
-        self.styles.add(ParagraphStyle(
-            "SectionHead", parent=self.styles["Heading1"],
-            fontSize=16, textColor=colors.HexColor(DT_PURPLE),
-            spaceBefore=16, spaceAfter=8,
-        ))
-        self.styles.add(ParagraphStyle(
-            "SubSection", parent=self.styles["Heading2"],
-            fontSize=13, textColor=colors.HexColor(DT_BLUE),
-            spaceBefore=10, spaceAfter=6,
-        ))
-        self.styles.add(ParagraphStyle(
-            "BodyText2", parent=self.styles["Normal"],
-            fontSize=9, leading=12, spaceAfter=4,
-        ))
-        self.styles.add(ParagraphStyle(
-            "SmallNote", parent=self.styles["Normal"],
-            fontSize=7, textColor=colors.HexColor("#999999"),
-        ))
-        self.styles.add(ParagraphStyle(
-            "CellText", parent=self.styles["Normal"],
-            fontSize=8, leading=10,
-        ))
+    def _tbl(self, data, cw=None, hc=None):
+        hc = hc or colors.HexColor(DT_PURPLE)
+        rows = []
+        for i, row in enumerate(data):
+            st = ParagraphStyle("_hc", parent=self.styles["CT"], textColor=colors.white, fontName="Helvetica-Bold") if i == 0 else self.styles["CT"]
+            rows.append([Paragraph(str(c), st) for c in row])
+        t = Table(rows, colWidths=cw, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),hc), ("TEXTCOLOR",(0,0),(-1,0),colors.white),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"), ("FONTSIZE",(0,0),(-1,-1),8),
+            ("ALIGN",(0,0),(-1,-1),"LEFT"), ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("GRID",(0,0),(-1,-1),0.5,colors.HexColor("#CCC")),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F5F5FF")]),
+            ("TOPPADDING",(0,0),(-1,-1),4), ("BOTTOMPADDING",(0,0),(-1,-1),4),
+            ("LEFTPADDING",(0,0),(-1,-1),4), ("RIGHTPADDING",(0,0),(-1,-1),4)]))
+        return t
 
     def generate(self):
-        doc = SimpleDocTemplate(
-            self.output_path,
-            pagesize=A4,
-            topMargin=20*mm,
-            bottomMargin=20*mm,
-            leftMargin=15*mm,
-            rightMargin=15*mm,
-        )
-        story = []
+        doc = SimpleDocTemplate(self.path, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm, leftMargin=15*mm, rightMargin=15*mm)
+        s = []
+        # Cover
+        s += [Spacer(1,80), Paragraph("Dynatrace Environment", self.styles["CoverTitle"]),
+              Paragraph("Analysis Report v4.0", self.styles["CoverTitle"]), Spacer(1,20),
+              HRFlowable(width="60%", color=colors.HexColor(DT_PURPLE), thickness=2), Spacer(1,20),
+              Paragraph(f"Environments: {' | '.join(r['name'] for r in self.results)}", self.styles["CoverSub"]),
+              Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y %H:%M')}", self.styles["CoverSub"]),
+              Paragraph("Observability Operations", self.styles["CoverSub"]), PageBreak()]
 
-        # ── Cover Page ─────────────────────────────────────────
-        story.append(Spacer(1, 80))
-        story.append(Paragraph("Dynatrace Environment", self.styles["CoverTitle"]))
-        story.append(Paragraph("Comprehensive Analysis Report", self.styles["CoverTitle"]))
-        story.append(Spacer(1, 20))
-        story.append(HRFlowable(width="60%", color=colors.HexColor(DT_PURPLE), thickness=2))
-        story.append(Spacer(1, 20))
-
-        env_names = [r["name"] for r in self.results]
-        story.append(Paragraph(f"Environments: {' | '.join(env_names)}", self.styles["CoverSub"]))
-        story.append(Paragraph(
-            f"Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')}",
-            self.styles["CoverSub"]
-        ))
-        story.append(Paragraph("Monitoring Admin — Observability Operations", self.styles["CoverSub"]))
-        story.append(Spacer(1, 30))
-
-        # API deprecation reference summary
-        story.append(Paragraph(
-            "Covers: Entity Topology, Problem Analysis, Alerting Config, SLOs, "
-            "ActiveGates, OneAgents, Deprecated API Audit, Extensions, Synthetic Monitors, "
-            "Management Zones, Auto-Tags, Network Zones, and Observability Gap Analysis.",
-            self.styles["BodyText2"]
-        ))
-        story.append(PageBreak())
-
-        # ── Table of Contents (manual) ─────────────────────────
-        story.append(Paragraph("Table of Contents", self.styles["SectionHead"]))
-        toc_items = [
-            "1. Executive Summary",
-            "2. Environment Overview & Entity Counts",
-            "3. Smartscape Topology Diagrams",
-            "4. Deprecated API Audit",
-            "5. Problem & Event Analysis",
-            "6. Alerting & Notification Config",
-            "7. SLO Assessment",
-            "8. Infrastructure Health (ActiveGates & OneAgents)",
-            "9. Governance (Mgmt Zones, Auto-Tags, Network Zones)",
-            "10. Gap Analysis — Consolidated Findings",
-            "11. Recommendations — Prioritized Action Plan",
-            "12. Appendix — Token Scopes & Deprecated API Reference",
-        ]
-        for item in toc_items:
-            story.append(Paragraph(item, self.styles["BodyText2"]))
-        story.append(PageBreak())
-
-        # ── 1. Executive Summary ───────────────────────────────
-        story.append(Paragraph("1. Executive Summary", self.styles["SectionHead"]))
-        total_gaps = sum(len(r["gaps"]) for r in self.results)
-        total_recs = sum(len(r["recommendations"]) for r in self.results)
-        critical_gaps = sum(1 for r in self.results for g in r["gaps"] if g["severity"] == "CRITICAL")
-        high_gaps = sum(1 for r in self.results for g in r["gaps"] if g["severity"] == "HIGH")
-
-        summary_data = [
-            ["Metric", "Value"],
-            ["Environments Analyzed", str(len(self.results))],
-            ["Total Gaps Found", str(total_gaps)],
-            ["Critical Gaps", str(critical_gaps)],
-            ["High Severity Gaps", str(high_gaps)],
-            ["Total Recommendations", str(total_recs)],
-        ]
+        # Exec Summary
+        s.append(Paragraph("1. Executive Summary", self.styles["SH"]))
+        tg = sum(len(r["gaps"]) for r in self.results)
+        tr = sum(len(r["recommendations"]) for r in self.results)
+        cr = sum(1 for r in self.results for g in r["gaps"] if g["severity"]=="CRITICAL")
+        rows = [["Metric","Value"],["Environments",str(len(self.results))],["Gaps",str(tg)],
+                ["Critical",str(cr)],["Recommendations",str(tr)]]
         for r in self.results:
-            ec = r["data"].get("entity_counts", {})
-            total_entities = sum(ec.values())
-            summary_data.append([f"{r['name']} — Monitored Entities", str(total_entities)])
-            summary_data.append([f"{r['name']} — Open Problems",
-                                 str(r["data"].get("problem_stats", {}).get("by_status", {}).get("OPEN", 0))])
+            ec = r["data"].get("entity_counts",{})
+            rows += [[f"{r['name']} Entities",str(sum(ec.values()))],
+                     [f"{r['name']} Open Problems",str(r["data"].get("problem_stats",{}).get("open_count",0))]]
+        s += [self._tbl(rows, [250,200]), PageBreak()]
 
-        story.append(self._make_table(summary_data, col_widths=[250, 200]))
-        story.append(Spacer(1, 10))
-        story.append(PageBreak())
-
-        # ── 2. Environment Overview ────────────────────────────
-        story.append(Paragraph("2. Environment Overview & Entity Counts", self.styles["SectionHead"]))
+        # Entities
+        s.append(Paragraph("2. Entities", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']} ({r['type']})", self.styles["SubSection"]))
-            story.append(Paragraph(f"URL: {r['url']}", self.styles["SmallNote"]))
-            story.append(Paragraph(f"Cluster Version: {r['data'].get('version', 'N/A')}", self.styles["BodyText2"]))
-
-            ec = r["data"].get("entity_counts", {})
+            s.append(Paragraph(f"{r['name']} ({r['type']}) — v{r['data'].get('version','?')}", self.styles["SS"]))
+            ec = r["data"].get("entity_counts",{})
             if ec:
-                rows = [["Entity Type", "Count"]]
-                for etype, count in sorted(ec.items(), key=lambda x: -x[1]):
-                    rows.append([etype, str(count)])
-                story.append(self._make_table(rows, col_widths=[280, 100]))
-            story.append(Spacer(1, 10))
-        story.append(PageBreak())
+                s.append(self._tbl([["Type","Count"]]+[[t,str(c)] for t,c in sorted(ec.items(), key=lambda x:-x[1]) if c>0], [280,100]))
+            s.append(Spacer(1,6))
+        s.append(PageBreak())
 
-        # ── 3. Smartscape Diagrams ─────────────────────────────
-        story.append(Paragraph("3. Smartscape Topology Diagrams", self.styles["SectionHead"]))
-        for env_name, diagram_path in self.diagrams.items():
-            if diagram_path and os.path.exists(diagram_path):
-                story.append(Paragraph(f"Topology — {env_name}", self.styles["SubSection"]))
+        # Smartscape
+        s.append(Paragraph("3. Smartscape", self.styles["SH"]))
+        for n, p in self.diagrams.items():
+            if p and os.path.exists(p):
+                s.append(Paragraph(n, self.styles["SS"]))
                 try:
-                    img = Image(diagram_path)
-                    # Scale to fit page width
-                    max_width = 500
-                    max_height = 600
-                    w, h = img.imageWidth, img.imageHeight
-                    if w > 0 and h > 0:
-                        ratio = min(max_width / w, max_height / h)
-                        img.drawWidth = w * ratio
-                        img.drawHeight = h * ratio
-                    story.append(img)
-                except Exception as e:
-                    story.append(Paragraph(f"(Diagram could not be embedded: {e})", self.styles["SmallNote"]))
-                story.append(Spacer(1, 10))
-            else:
-                story.append(Paragraph(
-                    f"Topology — {env_name}: No entities found or diagram generation failed.",
-                    self.styles["BodyText2"]
-                ))
-        story.append(PageBreak())
+                    img = Image(p); w,h = img.imageWidth, img.imageHeight
+                    if w>0 and h>0: ratio=min(500/w,580/h); img.drawWidth,img.drawHeight=w*ratio,h*ratio
+                    s.append(img)
+                except: pass
+        s.append(PageBreak())
 
-        # ── 4. Deprecated API Audit ────────────────────────────
-        story.append(Paragraph("4. Deprecated API Audit", self.styles["SectionHead"]))
-        story.append(Paragraph(
-            "The following deprecated v1 endpoints were probed to determine if they are still "
-            "accessible (indicating potential live usage by scripts/integrations).",
-            self.styles["BodyText2"]
-        ))
+        # Deprecated
+        s.append(Paragraph("4. Deprecated API Audit", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']}", self.styles["SubSection"]))
-            dep = r["data"].get("deprecated_apis", {})
+            s.append(Paragraph(r["name"], self.styles["SS"]))
+            dep = r["data"].get("deprecated_apis",{})
             if dep:
-                rows = [["Endpoint", "Status", "Replacement", "EOL"]]
-                for ep, info in dep.items():
-                    status = "ACCESSIBLE" if info["accessible"] else "Blocked/404"
-                    api_info = info.get("info", {})
-                    rows.append([
-                        ep,
-                        status,
-                        api_info.get("replacement", "—")[:50],
-                        api_info.get("eol", "TBD"),
-                    ])
-                story.append(self._make_table(rows, col_widths=[150, 70, 180, 60]))
-            story.append(Spacer(1, 8))
+                s.append(self._tbl([["Endpoint","Status","Replacement","EOL"]]+
+                    [[ep,"LIVE" if i["accessible"] else "OK",i.get("info",{}).get("replacement","-")[:48],
+                      i.get("info",{}).get("eol","TBD")] for ep,i in dep.items()], [135,45,200,55]))
+        s += [Spacer(1,8), Paragraph("Full Reference", self.styles["SS"]),
+              self._tbl([["Endpoint","Replacement","Since","EOL","Sev"]]+
+                  [[e,i["replacement"][:40],i["deprecated_since"][:20],i["eol"],i["severity"]]
+                   for e,i in DEPRECATED_API_MAP.items()], [110,135,80,55,50],
+                  hc=colors.HexColor("#8B0000")), PageBreak()]
 
-        # Full deprecation reference
-        story.append(Paragraph("Complete Deprecated API Reference", self.styles["SubSection"]))
-        dep_rows = [["Deprecated Endpoint", "Replacement", "Since", "EOL", "Severity"]]
-        for ep, info in DEPRECATED_API_MAP.items():
-            dep_rows.append([
-                ep,
-                info["replacement"][:45],
-                info["deprecated_since"][:20],
-                info["eol"],
-                info["severity"],
-            ])
-        story.append(self._make_table(dep_rows, col_widths=[120, 140, 80, 55, 55],
-                                       header_color=colors.HexColor("#8B0000")))
-        story.append(PageBreak())
-
-        # ── 5. Problem Analysis ────────────────────────────────
-        story.append(Paragraph("5. Problem & Event Analysis", self.styles["SectionHead"]))
+        # Problems + Noise + Davis
+        s.append(Paragraph("5. Problems, Noise & Davis AI", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']}", self.styles["SubSection"]))
-            ps = r["data"].get("problem_stats", {})
+            s.append(Paragraph(r["name"], self.styles["SS"]))
+            ps = r["data"].get("problem_stats",{})
             if ps:
-                rows = [["Metric", "Value"]]
-                rows.append(["Total Problems (last 30d)", str(ps.get("total", 0))])
-                for status, count in ps.get("by_status", {}).items():
-                    rows.append([f"  Status: {status}", str(count)])
-                for sev, count in ps.get("by_severity", {}).items():
-                    rows.append([f"  Severity: {sev}", str(count)])
-                story.append(self._make_table(rows, col_widths=[280, 100]))
-            else:
-                story.append(Paragraph("No problems found in lookback period.", self.styles["BodyText2"]))
-            story.append(Spacer(1, 8))
-        story.append(PageBreak())
+                s.append(self._tbl([["Metric","Value"],["Total",str(ps.get("total",0))],["Open",str(ps.get("open_count",0))]]+
+                    [[f"  {k}",str(v)] for k,v in ps.get("by_severity",{}).items()], [280,100]))
+                ns = ps.get("top_noise_sources",[])
+                if ns:
+                    s += [Paragraph("Noise Sources", self.styles["SS"]),
+                          self._tbl([["Problem","Count"]]+[[t[:55],str(c)] for t,c in ns[:10]], [340,60])]
+            s += [Paragraph(f"Davis: {r['data'].get('davis_ai_summary','N/A')}", self.styles["BT"]), Spacer(1,6)]
+        s.append(PageBreak())
 
-        # ── 6. Alerting Config ─────────────────────────────────
-        story.append(Paragraph("6. Alerting & Notification Configuration", self.styles["SectionHead"]))
+        # Alerting + Anomaly
+        s.append(Paragraph("6. Alerting & Anomaly Detection", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']}", self.styles["SubSection"]))
-            ap = r["data"].get("alerting_profiles", [])
-            nf = r["data"].get("notifications", [])
-            mw = r["data"].get("maintenance_windows", [])
-            rows = [["Config Item", "Count"]]
-            rows.append(["Alerting Profiles", str(len(ap))])
-            rows.append(["Notification Rules", str(len(nf))])
-            rows.append(["Maintenance Windows", str(len(mw))])
-            story.append(self._make_table(rows, col_widths=[280, 100]))
-            story.append(Spacer(1, 8))
-        story.append(PageBreak())
+            s.append(Paragraph(r["name"], self.styles["SS"]))
+            rows = [["Config","Count"],
+                    ["Alerting Profiles",str(len(r["data"].get("alerting_profiles",[])))],
+                    ["Notifications",str(len(r["data"].get("notifications",[])))],
+                    ["Maintenance Windows",str(len(r["data"].get("maintenance_windows",[])))]]
+            for k,v in r["data"].get("anomaly_detection",{}).items(): rows.append([f"Anomaly: {k}",str(v)])
+            s.append(self._tbl(rows, [280,100]))
+        s.append(PageBreak())
 
-        # ── 7. SLO Assessment ──────────────────────────────────
-        story.append(Paragraph("7. SLO Assessment", self.styles["SectionHead"]))
+        # SLOs
+        s.append(Paragraph("7. SLOs", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']}", self.styles["SubSection"]))
-            slos = r["data"].get("slos", [])
+            s.append(Paragraph(r["name"], self.styles["SS"]))
+            slos = r["data"].get("slos",[])
             if slos:
-                rows = [["SLO Name", "Target %", "Actual %", "Status"]]
-                for s in slos[:20]:
-                    target = s.get("target", "—")
-                    actual = s.get("evaluatedPercentage", "—")
-                    if isinstance(actual, (int, float)) and isinstance(target, (int, float)):
-                        status = "OK" if actual >= target else "BREACHING"
-                    else:
-                        status = "—"
-                    rows.append([
-                        str(s.get("name", "unnamed"))[:40],
-                        f"{target}",
-                        f"{actual:.2f}" if isinstance(actual, float) else str(actual),
-                        status,
-                    ])
-                story.append(self._make_table(rows, col_widths=[180, 70, 70, 70]))
-            else:
-                story.append(Paragraph("No SLOs configured.", self.styles["BodyText2"]))
-            story.append(Spacer(1, 8))
-        story.append(PageBreak())
+                s.append(self._tbl([["SLO","Target","Actual","Status"]]+
+                    [[str(sl.get("name","?"))[:38],str(sl.get("target","-")),
+                      f"{sl['evaluatedPercentage']:.1f}" if isinstance(sl.get("evaluatedPercentage"),(int,float)) else "-",
+                      "OK" if isinstance(sl.get("evaluatedPercentage"),(int,float)) and isinstance(sl.get("target"),(int,float)) and sl["evaluatedPercentage"]>=sl["target"] else "BREACH"]
+                     for sl in slos[:20]], [175,65,65,55]))
+            else: s.append(Paragraph("No SLOs.", self.styles["BT"]))
+        s.append(PageBreak())
 
-        # ── 8. Infrastructure Health ───────────────────────────
-        story.append(Paragraph("8. Infrastructure Health", self.styles["SectionHead"]))
+        # Ingestion
+        s.append(Paragraph("8. Data Ingestion (30d)", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']} — ActiveGates", self.styles["SubSection"]))
-            ags = r["data"].get("activegates", [])
+            s.append(Paragraph(r["name"], self.styles["SS"]))
+            ing = r["data"].get("ingestion",{})
+            if ing: s.append(self._tbl([["Metric","Value"]]+[[k,f"{v:,.2f}"] for k,v in ing.items()], [280,100]))
+        s.append(PageBreak())
+
+        # Infra
+        s.append(Paragraph("9. Infrastructure", self.styles["SH"]))
+        for r in self.results:
+            ags = r["data"].get("activegates",[])
             if ags:
-                rows = [["Hostname", "Version", "OS", "Modules"]]
-                for ag in ags[:15]:
-                    modules = [m.get("type", "") for m in ag.get("modules", [])]
-                    rows.append([
-                        str(ag.get("hostname", "—"))[:30],
-                        str(ag.get("version", "—"))[:20],
-                        str(ag.get("osType", "—")),
-                        ", ".join(modules)[:50] if modules else "—",
-                    ])
-                story.append(self._make_table(rows, col_widths=[120, 80, 60, 180]))
-            else:
-                story.append(Paragraph("No ActiveGates found.", self.styles["BodyText2"]))
+                s += [Paragraph(f"{r['name']} AGs", self.styles["SS"]),
+                      self._tbl([["Host","Version","OS","Modules"]]+
+                          [[str(a.get("hostname","-"))[:28],str(a.get("version","-"))[:18],str(a.get("osType","-")),
+                            ", ".join(m.get("type","") for m in a.get("modules",[]))[:45] or "-"] for a in ags[:12]],
+                          [115,75,55,190])]
+        s.append(PageBreak())
 
-            # Extensions
-            story.append(Paragraph(f"{r['name']} — Extensions 2.0", self.styles["SubSection"]))
-            exts = r["data"].get("extensions", [])
-            if exts:
-                rows = [["Extension", "Version"]]
-                for ext in exts[:20]:
-                    rows.append([
-                        str(ext.get("extensionName", "—"))[:50],
-                        str(ext.get("version", "—")),
-                    ])
-                story.append(self._make_table(rows, col_widths=[300, 100]))
-            else:
-                story.append(Paragraph("No Extensions 2.0 found.", self.styles["BodyText2"]))
-            story.append(Spacer(1, 8))
-        story.append(PageBreak())
-
-        # ── 9. Governance ──────────────────────────────────────
-        story.append(Paragraph("9. Governance", self.styles["SectionHead"]))
+        # Governance
+        s.append(Paragraph("10. Governance", self.styles["SH"]))
         for r in self.results:
-            story.append(Paragraph(f"{r['name']}", self.styles["SubSection"]))
-            rows = [["Governance Item", "Count"]]
-            rows.append(["Management Zones", str(len(r["data"].get("mgmt_zones", [])))])
-            rows.append(["Auto-Tag Rules", str(len(r["data"].get("auto_tags", [])))])
-            rows.append(["Network Zones", str(len(r["data"].get("network_zones", [])))])
-            rows.append(["Synthetic Monitors", str(len(r["data"].get("synthetic", [])))])
-            story.append(self._make_table(rows, col_widths=[280, 100]))
-            story.append(Spacer(1, 8))
-        story.append(PageBreak())
+            s += [Paragraph(r["name"], self.styles["SS"]),
+                  self._tbl([["Item","Count"],["Mgmt Zones",str(len(r["data"].get("mgmt_zones",[])))],
+                             ["Auto-Tags",str(len(r["data"].get("auto_tags",[])))],
+                             ["Network Zones",str(len(r["data"].get("network_zones",[])))],
+                             ["Synthetic",str(len(r["data"].get("synthetic",[])))],
+                             ["Extensions",str(len(r["data"].get("extensions",[])))]], [280,100])]
+        s.append(PageBreak())
 
-        # ── 10. Gap Analysis ───────────────────────────────────
-        story.append(Paragraph("10. Gap Analysis — Consolidated Findings", self.styles["SectionHead"]))
-        all_gaps = []
+        # Gaps
+        s.append(Paragraph("11. All Gaps", self.styles["SH"]))
+        ag = [[r["name"],g["severity"],g["category"],g["finding"],g["impact"]] for r in self.results for g in r["gaps"]]
+        if ag:
+            ag.sort(key=lambda x: {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3}.get(x[1],4))
+            s.append(self._tbl([["Env","Sev","Cat","Finding","Impact"]]+ag, [48,48,62,160,130], hc=colors.HexColor("#8B0000")))
+        s.append(PageBreak())
+
+        # Recs
+        s.append(Paragraph("12. Recommendations", self.styles["SH"]))
+        seen, ar = set(), []
         for r in self.results:
-            for g in r["gaps"]:
-                all_gaps.append([r["name"], g["severity"], g["category"], g["finding"], g["impact"]])
+            for rc in r["recommendations"]:
+                k = rc["action"][:80]
+                if k not in seen: seen.add(k); ar.append([r["name"],rc["priority"],rc["category"],rc["action"],rc["effort"]])
+        if ar:
+            ar.sort(key=lambda x: {"P0":0,"P1":1,"P2":2,"P3":3}.get(x[1],4))
+            s.append(self._tbl([["Env","Pri","Cat","Action","Effort"]]+ar, [48,32,62,215,42]))
+        s.append(PageBreak())
 
-        if all_gaps:
-            # Sort by severity
-            sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-            all_gaps.sort(key=lambda x: sev_order.get(x[1], 4))
-            rows = [["Env", "Severity", "Category", "Finding", "Impact"]]
-            rows.extend(all_gaps)
-            story.append(self._make_table(rows, col_widths=[50, 55, 70, 150, 130],
-                                           header_color=colors.HexColor("#8B0000")))
-        else:
-            story.append(Paragraph("No gaps identified — excellent posture!", self.styles["BodyText2"]))
-        story.append(PageBreak())
-
-        # ── 11. Recommendations ────────────────────────────────
-        story.append(Paragraph("11. Recommendations — Prioritized Action Plan", self.styles["SectionHead"]))
-        all_recs = []
+        # Appendix
+        s.append(Paragraph("13. Token Scopes", self.styles["SH"]))
         for r in self.results:
-            for rec in r["recommendations"]:
-                all_recs.append([r["name"], rec["priority"], rec["category"],
-                                 rec["action"], rec["effort"]])
+            sc = r["data"].get("scopes",{})
+            if sc:
+                s += [Paragraph(r["name"], self.styles["SS"]),
+                      self._tbl([["Scope","Status"]]+[[k,"OK" if v else "MISSING"] for k,v in sorted(sc.items())], [250,150])]
+        s += [Spacer(1,20), HRFlowable(width="100%",color=colors.HexColor("#CCC"),thickness=0.5),
+              Paragraph("Dynatrace Analyzer v4.0 — Observability Operations", self.styles["SN"])]
 
-        if all_recs:
-            pri_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
-            all_recs.sort(key=lambda x: pri_order.get(x[1], 4))
-            # Deduplicate by action text
-            seen = set()
-            unique_recs = []
-            for rec in all_recs:
-                key = rec[3][:80]
-                if key not in seen:
-                    seen.add(key)
-                    unique_recs.append(rec)
-            rows = [["Env", "Priority", "Category", "Action", "Effort"]]
-            rows.extend(unique_recs)
-            story.append(self._make_table(rows, col_widths=[50, 45, 65, 200, 45]))
-        story.append(PageBreak())
-
-        # ── 12. Appendix ───────────────────────────────────────
-        story.append(Paragraph("12. Appendix — Token Scopes Validation", self.styles["SectionHead"]))
-        for r in self.results:
-            story.append(Paragraph(f"{r['name']}", self.styles["SubSection"]))
-            scopes = r["data"].get("scopes", {})
-            if scopes:
-                rows = [["Scope", "Status"]]
-                for scope, ok in sorted(scopes.items()):
-                    rows.append([scope, "OK" if ok else "MISSING / DENIED"])
-                story.append(self._make_table(rows, col_widths=[250, 150]))
-            story.append(Spacer(1, 8))
-
-        # Footer note
-        story.append(Spacer(1, 20))
-        story.append(HRFlowable(width="100%", color=colors.HexColor("#CCCCCC"), thickness=0.5))
-        story.append(Paragraph(
-            "This report was auto-generated by the Dynatrace Multi-Environment Analyzer. "
-            "For questions, contact the Observability Operations team.",
-            self.styles["SmallNote"]
-        ))
-
-        # Build PDF
-        doc.build(story)
-        log.info(f"PDF report generated: {self.output_path}")
-
-    def _make_table(self, data: List[List], col_widths: List[int] = None,
-                    header_color=None) -> Table:
-        """Create a styled table from data rows."""
-        if header_color is None:
-            header_color = colors.HexColor(DT_PURPLE)
-
-        # Wrap cell text in Paragraphs for wrapping
-        wrapped = []
-        for i, row in enumerate(data):
-            wrapped_row = []
-            for cell in row:
-                style = self.styles["CellText"]
-                if i == 0:
-                    style = ParagraphStyle("HeaderCell", parent=style,
-                                           textColor=colors.white, fontName="Helvetica-Bold")
-                wrapped_row.append(Paragraph(str(cell), style))
-            wrapped.append(wrapped_row)
-
-        tbl = Table(wrapped, colWidths=col_widths, repeatRows=1)
-        style_cmds = [
-            ("BACKGROUND", (0, 0), (-1, 0), header_color),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#CCCCCC")),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F5FF")]),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ]
-        tbl.setStyle(TableStyle(style_cmds))
-        return tbl
+        doc.build(s)
+        log.info(f"PDF: {self.path}")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN ORCHESTRATOR
+#  MAIN
 # ═══════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Dynatrace Multi-Environment Comprehensive Analyzer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python dt_env_analyzer.py --config config.yaml
-  python dt_env_analyzer.py --config config.yaml --output my_report.pdf
-  python dt_env_analyzer.py --generate-template
-        """
-    )
-    parser.add_argument("--config", default="config.yaml", help="Path to YAML config file")
-    parser.add_argument("--output", default=None, help="Output PDF report path")
-    parser.add_argument("--generate-template", action="store_true", help="Generate config template and exit")
-    parser.add_argument("--skip-diagrams", action="store_true", help="Skip Smartscape diagram generation")
-    parser.add_argument("--lookback", type=int, default=None, help="Override lookback days for problems/events")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Dynatrace Multi-Environment Analyzer v4.0")
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--output", default=None)
+    ap.add_argument("--html", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--generate-template", action="store_true")
+    ap.add_argument("--skip-diagrams", action="store_true")
+    ap.add_argument("--lookback", type=int)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
+    if args.verbose: logging.getLogger().setLevel(logging.DEBUG)
     if args.generate_template:
         Path("config.yaml.template").write_text(DEFAULT_CONFIG_TEMPLATE)
-        log.info("Template written to config.yaml.template")
-        return
+        log.info("Template: config.yaml.template"); return
 
-    # Load config
     cfg = load_config(args.config)
-    settings = cfg.get("settings", {})
-    output_dir = settings.get("output_dir", "./dt_reports")
-    os.makedirs(output_dir, exist_ok=True)
+    st = cfg.get("settings", {})
+    outdir = st.get("output_dir", "./dt_reports"); os.makedirs(outdir, exist_ok=True)
+    lookback = args.lookback or st.get("lookback_days", 30)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pdf_path = args.output or os.path.join(outdir, f"dt_analysis_{ts}.pdf")
+    do_html = args.html or st.get("generate_html", True)
+    do_json = args.json or st.get("generate_json", True)
 
-    lookback = args.lookback or settings.get("lookback_days", 30)
-    timeout = settings.get("timeout_seconds", 30)
-    retries = settings.get("max_retries", 3)
-    rate_pause = settings.get("rate_limit_pause", 0.25)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = args.output or os.path.join(output_dir, f"dt_analysis_{timestamp}.pdf")
-
-    # ── Analyze each environment ───────────────────────────────
-    all_results = []
-    all_diagrams = {}
-
-    for env_cfg in cfg["environments"]:
-        client = DynatraceClient(
-            name=env_cfg["name"],
-            url=env_cfg["url"],
-            token=env_cfg["token"],
-            env_type=env_cfg.get("type", "SaaS"),
-            timeout=timeout,
-            max_retries=retries,
-            rate_pause=rate_pause,
-        )
-        analyzer = EnvironmentAnalyzer(client, lookback_days=lookback)
-
+    results, diagrams = [], {}
+    for ec in cfg["environments"]:
+        client = DynatraceClient(ec["name"], ec["url"], ec["token"], ec.get("type","SaaS"),
+                                  ec.get("verify_ssl",True), st.get("timeout_seconds",30),
+                                  st.get("max_retries",3), st.get("rate_limit_pause",0.25))
         try:
-            result = analyzer.run_full_analysis()
-            all_results.append(result)
+            result = EnvironmentAnalyzer(client, lookback).run()
+            results.append(result)
         except Exception as e:
-            log.error(f"Analysis failed for {env_cfg['name']}: {e}")
-            traceback.print_exc()
-            all_results.append({
-                "name": env_cfg["name"],
-                "url": env_cfg["url"],
-                "type": env_cfg.get("type", "SaaS"),
-                "data": {},
-                "gaps": [{"category": "Analysis", "severity": "CRITICAL",
-                          "finding": f"Analysis failed: {e}", "impact": "No data collected"}],
-                "recommendations": [],
-                "api_calls": 0,
-            })
+            log.error(f"{ec['name']} failed: {e}"); traceback.print_exc()
+            result = {"name":ec["name"],"url":ec["url"],"type":ec.get("type","SaaS"),
+                      "timestamp":datetime.now().isoformat(),
+                      "data":{"entities":{},"entity_counts":{}},
+                      "gaps":[{"category":"Analysis","severity":"CRITICAL","finding":str(e),"impact":"No data"}],
+                      "recommendations":[],"api_calls":0}
+            results.append(result)
 
-        # Generate Smartscape diagram
         if not args.skip_diagrams:
-            entities = result.get("data", {}).get("entities", {}) if 'result' in dir() else {}
-            if any(len(v) > 0 for v in entities.values()):
-                diagram_gen = SmartscapeDiagram(env_cfg["name"], entities, output_dir)
-                diagram_path = diagram_gen.generate()
-                all_diagrams[env_cfg["name"]] = diagram_path
-            else:
-                all_diagrams[env_cfg["name"]] = None
+            ents = result.get("data",{}).get("entities",{})
+            if any(len(v)>0 for v in ents.values()):
+                diagrams[ec["name"]] = SmartscapeDiagram(ec["name"], ents, outdir).generate()
+            else: diagrams[ec["name"]] = None
 
-    # ── Generate PDF Report ────────────────────────────────────
-    log.info("Generating consolidated PDF report...")
-    report = ReportGenerator(all_results, output_path, all_diagrams)
-    report.generate()
+    # Outputs
+    PDFReport(results, pdf_path, diagrams).generate()
+    html_path = HTMLDashboard(results, outdir, diagrams).generate() if do_html else None
+    json_path = None
+    if do_json:
+        json_path = os.path.join(outdir, f"dt_audit_{ts}.json")
+        export = []
+        for r in results:
+            safe = {k:v for k,v in r.items() if k != "data"}
+            safe["data"] = {k:v for k,v in r.get("data",{}).items() if k not in ("entities","problems_raw")}
+            safe["data"]["entity_counts"] = r["data"].get("entity_counts",{})
+            export.append(safe)
+        with open(json_path, "w") as f: json.dump(export, f, indent=2, default=str)
+        log.info(f"JSON: {json_path}")
 
-    # ── Summary ────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("  ANALYSIS COMPLETE")
-    print("=" * 60)
-    for r in all_results:
-        print(f"\n  {r['name']}:")
-        print(f"    Entities: {sum(r['data'].get('entity_counts', {}).values())}")
-        print(f"    Gaps:     {len(r['gaps'])}")
-        print(f"    Recs:     {len(r['recommendations'])}")
-        print(f"    API calls: {r['api_calls']}")
-    print(f"\n  Report: {output_path}")
-    for name, path in all_diagrams.items():
-        if path:
-            print(f"  Diagram ({name}): {path}")
-    print("=" * 60)
-
+    print(f"\n{'='*55}\n  ANALYSIS COMPLETE v4.0\n{'='*55}")
+    for r in results:
+        ec = r["data"].get("entity_counts",{})
+        print(f"\n  {r['name']}: {sum(ec.values())} entities, {len(r['gaps'])} gaps, {len(r['recommendations'])} recs, {r['api_calls']} calls")
+    print(f"\n  PDF:  {pdf_path}")
+    if html_path: print(f"  HTML: {html_path}")
+    if json_path: print(f"  JSON: {json_path}")
+    for n,p in diagrams.items():
+        if p: print(f"  Diagram ({n}): {p}")
+    print(f"{'='*55}")
 
 if __name__ == "__main__":
     main()

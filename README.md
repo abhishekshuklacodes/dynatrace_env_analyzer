@@ -1,6 +1,6 @@
-# Dynatrace Multi-Environment Analyzer
+# Dynatrace Multi-Environment Analyzer v4.0
 
-> Comprehensive audit, gap analysis, and Smartscape-like topology diagrams across multiple Dynatrace environments — with full deprecated API detection aligned to Dynatrace's latest v1→v2 migration timeline.
+> Comprehensive audit, gap analysis, noise detection, and Smartscape topology diagrams across multiple Dynatrace environments — with deprecated API detection, Davis AI summary, interactive HTML dashboard, and PDF/JSON export.
 
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Dynatrace API](https://img.shields.io/badge/Dynatrace-API%20v2-6F2DA8)
@@ -8,78 +8,76 @@
 
 ---
 
-## What It Does
+## What's New in v4.0
 
-This script connects to **multiple Dynatrace environments** (PROD, NON-PROD, DR, etc.) via the **Environment API v2** and performs a comprehensive analysis covering:
-
-| Domain | Details |
-|--------|---------|
-| **Entity Topology** | Hosts, Services, Process Groups, Applications, K8s Clusters with full relationship mapping |
-| **Smartscape Diagrams** | Auto-generated Graphviz topology diagrams per environment (PNG) |
-| **Deprecated API Audit** | Probes v1 endpoints to detect live usage; maps all deprecated APIs with EOL dates |
-| **Problem Analysis** | 30-day problem feed — severity breakdown, open count, noise detection |
-| **Alerting Config** | Alerting profiles, notification rules, maintenance windows via Settings 2.0 |
-| **SLO Assessment** | Evaluates all SLOs and flags breaching targets |
-| **Infrastructure Health** | ActiveGate versions/modules, OneAgent update status |
-| **Governance** | Management zones, auto-tag rules, network zones |
-| **Observability Gaps** | Missing RUM, no synthetic monitors, no MZ, untagged entities |
-| **Prioritized Recommendations** | P0→P3 action plan with effort estimates |
-
-**Output:** A multi-section **PDF report** + **PNG topology diagrams** per environment.
+| Feature | Source | Description |
+|---------|--------|-------------|
+| **Data Ingestion Metrics** | v3.2 merge | Log, metric, DDU volumes via Metrics v2 API |
+| **Noise Analysis** | v3.2 merge | Recurring problem detection with top noise sources |
+| **Anomaly Detection Audit** | v3.2 merge | Services, RUM, infra, disk, DB anomaly settings |
+| **Davis AI Summary** | v3.2 merge | Per-environment Davis AI problem digest |
+| **HTML Dashboard** | v3.2 merge | Interactive Plotly charts, tabbed navigation |
+| **JSON Export** | New | Raw data for n8n/ServiceNow/JIRA automation |
+| **SSL Toggle** | v3.2 merge | `verify_ssl: false` for Managed behind proxy |
+| **Zero SDK** | Refactor | Pure `requests` — no `dynatrace` SDK dependency |
+| **Pagination Fix** | Bugfix | Correct nextPageKey handling per Dynatrace docs |
+| **Expanded Deprecated Probes** | New | Config v1 autoTags, alertingProfiles, notifications, MZ |
 
 ---
 
-## Deprecated API Coverage
+## Output
 
-The analyzer tracks all major Dynatrace API deprecations including:
+The analyzer produces **three outputs**:
 
-| Deprecated | Replacement | EOL |
-|-----------|-------------|-----|
-| Timeseries API v1 | Metrics API v2 | End of 2025 |
-| Topology & Smartscape API | Monitored Entities API v2 | TBD |
-| Problems API v1 | Problems API v2 | TBD |
-| Events API v1 | Events API v2 | TBD |
-| Log Monitoring v2 (search/export) | Grail Query API | End of 2027 |
-| Config v1 (autoTags, alertingProfiles, notifications, managementZones) | Settings 2.0 API | TBD |
-| Maintenance Windows (env + config) | Settings 2.0 | TBD |
-| Credential Vault (config) | Credential Vault (env v2) | TBD |
-| Tokens API v1 | Access Tokens API v2 | TBD |
+```
+dt_reports/
+├── dt_analysis_20260315_143022.pdf     # 13-section PDF report
+├── dashboard_v4.0.html                  # Interactive HTML dashboard
+├── dt_audit_20260315_143022.json        # Raw JSON for automation
+├── smartscape_PROD.png                  # Topology diagram
+├── smartscape_NON-PROD.png
+└── smartscape_DR.png
+```
+
+### PDF Report (13 sections)
+1. Executive Summary
+2. Entity Counts
+3. Smartscape Topology Diagrams
+4. Deprecated API Audit (with full reference table)
+5. Problems, Noise Sources & Davis AI Summary
+6. Alerting & Anomaly Detection Config
+7. SLO Assessment
+8. Data Ingestion (30d)
+9. Infrastructure (ActiveGates)
+10. Governance (MZ, Tags, Network Zones, Synthetic, Extensions)
+11. Gap Analysis — All Findings
+12. Recommendations — Prioritized
+13. Appendix — Token Scopes
+
+### HTML Dashboard (9 tabs)
+Overview | Davis AI | Noise Analysis | Alerts Config | Data Ingestion | Gap Matrix | Recommendations | Smartscape
 
 ---
 
 ## Quick Start
 
-### Prerequisites
-
-- Python 3.9+
-- Graphviz installed (`apt install graphviz` / `brew install graphviz`)
-- API tokens for each Dynatrace environment
-
-### Install
-
 ```bash
-git clone https://github.com/<your-username>/dynatrace-env-analyzer.git
-cd dynatrace-env-analyzer
+git clone https://github.com/abhishekshuklacodes/dynatrace_env_analyzer.git
+cd dynatrace_env_analyzer
 pip install -r requirements.txt
-```
-
-### Configure
-
-```bash
 cp config.yaml.template config.yaml
 # Edit config.yaml with your environment URLs and tokens
+python dt_env_analyzer.py --config config.yaml
 ```
 
 ### Required Token Scopes
 
-Create an API token in each environment (**Access Tokens → Generate new token**) with these scopes:
-
 | Scope | Purpose |
 |-------|---------|
 | `entities.read` | Entity topology & relationships |
-| `metrics.read` | Metrics metadata |
+| `metrics.read` | Metrics metadata + ingestion volumes |
 | `problems.read` | Problem feed analysis |
-| `settings.read` | Settings 2.0 (alerting, MZ, tags) |
+| `settings.read` | Settings 2.0 (alerting, MZ, tags, anomaly) |
 | `events.read` | Event feed |
 | `activeGates.read` | ActiveGate inventory |
 | `slo.read` | SLO evaluation |
@@ -88,96 +86,69 @@ Create an API token in each environment (**Access Tokens → Generate new token*
 | `networkZones.read` | Network zone config |
 | `extensions.read` | Extensions 2.0 inventory |
 
-### Run
+### CLI Options
 
 ```bash
-# Full analysis with PDF report + diagrams
-python dt_env_analyzer.py --config config.yaml
-
-# Custom output path
-python dt_env_analyzer.py --config config.yaml --output my_report.pdf
-
-# Skip diagram generation (no Graphviz needed)
-python dt_env_analyzer.py --config config.yaml --skip-diagrams
-
-# Custom lookback period
-python dt_env_analyzer.py --config config.yaml --lookback 90
-
-# Debug mode
-python dt_env_analyzer.py --config config.yaml -v
+python dt_env_analyzer.py --config config.yaml              # Full run (PDF + HTML + JSON)
+python dt_env_analyzer.py --config config.yaml --output r.pdf  # Custom PDF path
+python dt_env_analyzer.py --config config.yaml --skip-diagrams # No Graphviz needed
+python dt_env_analyzer.py --config config.yaml --lookback 90   # 90-day lookback
+python dt_env_analyzer.py --generate-template                  # Create config template
+python dt_env_analyzer.py -v                                   # Debug logging
 ```
-
----
-
-## Output Structure
-
-```
-dt_reports/
-├── dt_analysis_20260314_143022.pdf     # Full PDF report
-├── smartscape_PROD.png                  # Topology diagram — PROD
-├── smartscape_NON-PROD.png              # Topology diagram — NON-PROD
-└── smartscape_DR.png                    # Topology diagram — DR
-```
-
-### PDF Report Sections
-
-1. Executive Summary
-2. Environment Overview & Entity Counts
-3. Smartscape Topology Diagrams
-4. Deprecated API Audit
-5. Problem & Event Analysis
-6. Alerting & Notification Configuration
-7. SLO Assessment
-8. Infrastructure Health (ActiveGates & OneAgents)
-9. Governance (Management Zones, Auto-Tags, Network Zones)
-10. Gap Analysis — Consolidated Findings
-11. Recommendations — Prioritized Action Plan
-12. Appendix — Token Scopes & Deprecated API Reference
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   config.yaml   │────▶│  DynatraceClient │────▶│ Environment API  │
-│  (3 environments│     │  (pagination,     │     │ v2 endpoints     │
-│   + tokens)     │     │   retry, rate     │     │                  │
-└─────────────────┘     │   limiting)       │     └──────────────────┘
-                        └────────┬─────────┘
-                                 │
-                    ┌────────────▼────────────┐
-                    │  EnvironmentAnalyzer    │
-                    │  - Entity topology      │
-                    │  - Problem analysis     │
-                    │  - Alerting audit       │
-                    │  - SLO evaluation       │
-                    │  - Deprecated API probe │
-                    │  - Gap analysis         │
-                    └────────────┬────────────┘
-                                 │
-              ┌──────────────────┼──────────────────┐
-              ▼                  ▼                   ▼
-    ┌─────────────────┐ ┌──────────────┐  ┌─────────────────┐
-    │ SmartscapeDiagram│ │ReportGenerator│  │  Console Output │
-    │ (Graphviz PNG)   │ │ (PDF report) │  │  (Summary)      │
-    └─────────────────┘ └──────────────┘  └─────────────────┘
+config.yaml ──► DynatraceClient ──► Dynatrace API v2
+                (pagination,         ├── /api/v2/entities
+                 retry,              ├── /api/v2/problems
+                 rate-limit)         ├── /api/v2/settings/objects
+                      │              ├── /api/v2/metrics/query
+                      ▼              ├── /api/v2/slo
+               EnvironmentAnalyzer   ├── /api/v2/activeGates
+               ├── Entity topology   ├── /api/v2/oneAgents
+               ├── Problem + noise   ├── /api/v2/extensions
+               ├── Ingestion metrics └── /api/v1/* (deprecated probes)
+               ├── Anomaly detection
+               ├── Deprecated probes
+               └── Gap analysis
+                      │
+          ┌───────────┼───────────┐
+          ▼           ▼           ▼
+    PDFReport    HTMLDashboard   JSON Export
+    (reportlab)  (Plotly/BS5)   (raw data)
+          │
+    SmartscapeDiagram
+    (Graphviz PNG)
 ```
 
 ---
 
-## Security Notes
+## Deprecated API Coverage
 
-- `config.yaml` is in `.gitignore` — **never commit tokens**
-- Tokens are passed via `Authorization: Api-Token` header (not URL params)
-- All API calls use HTTPS
-- Rate limiting built in to avoid throttling
+| Deprecated | Replacement | EOL |
+|-----------|-------------|-----|
+| Timeseries v1 | Metrics v2 | End of 2025 |
+| Topology & Smartscape | Entities v2 | TBD |
+| Problems v1 | Problems v2 | TBD |
+| Events v1 | Events v2 | TBD |
+| Log Monitoring v2 search/export | Grail Query API | End of 2027 |
+| Config v1 (autoTags, alerting, notifications, MZ) | Settings 2.0 | TBD |
+| Maintenance Windows (env + config) | Settings 2.0 | TBD |
+| Credential Vault (config) | Credential Vault v2 | TBD |
+| Tokens v1 | Access Tokens v2 | TBD |
 
 ---
 
-## Contributing
+## Security
 
-PRs welcome. Please ensure any new API endpoints follow the v2 pattern and include proper deprecation mapping.
+- `config.yaml` is in `.gitignore` — **never commit tokens**
+- Auth via `Authorization: Api-Token` header (not URL params)
+- All calls over HTTPS
+- `verify_ssl: false` available for Managed environments behind corporate proxy
 
 ---
 
